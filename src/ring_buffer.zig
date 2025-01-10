@@ -1,0 +1,128 @@
+const std = @import("std");
+const assert = std.debug.assert;
+
+const AtomicSize = std.atomic.Value(usize);
+
+pub fn RingBuffer(comptime size: u32) type {
+    std.debug.assert(@popCount(size) == 1);
+    std.debug.assert(size > 1);
+
+    return struct {
+        buffer: [size]u8 = undefined,
+        head: AtomicSize align(64) = AtomicSize.init(0),
+        tail: AtomicSize align(64) = AtomicSize.init(0),
+
+        const Self = @This();
+        pub const SIZE = size;
+        const MASK = size - 1;
+
+        pub fn reset(self: *Self) void {
+            self.head.store(0, .release);
+            self.tail.store(0, .release);
+        }
+
+        // Producer side
+        //
+        pub fn write_len(self: *Self) usize {
+            return SIZE - self.read_len();
+        }
+
+        pub fn write_slice(self: *Self) []u8 {
+            const rhead = self.head.raw;
+            const rtail = self.tail.raw;
+            const avail = SIZE -% (rhead -% rtail);
+            const head = rhead & MASK;
+            const wrap = SIZE - head;
+
+            return self.buffer[head..(head +% @min(avail, wrap))];
+        }
+
+        pub fn commit(self: *Self, count: usize) void {
+            assert(count <= self.write_len());
+            self.head.store(self.head.raw +% count, .release);
+        }
+
+        // Consumer Side
+        //
+        pub fn read_len(self: *Self) usize {
+            return self.head.raw -% self.tail.raw;
+        }
+
+        pub fn read_slice(self: *Self) []const u8 {
+            const rhead = self.head.raw;
+            const rtail = self.tail.raw;
+            const avail = rhead -% rtail;
+            const tail = rtail & MASK;
+            const wrap = SIZE - tail;
+
+            return self.buffer[tail..(tail +% @min(avail, wrap))];
+        }
+
+        pub fn release(self: *Self, count: usize) void {
+            assert(count <= self.read_len());
+            self.tail.store(self.tail.raw +% count, .release);
+        }
+    };
+}
+
+const t = std.testing;
+
+test "RingBuffer concurrent access" {
+    const ITERS = 654321;
+
+    const expected_cksum: usize = blk: {
+        var sum: usize = 0;
+        for (0..ITERS) |i| {
+            const byte: u8 = @truncate(i);
+            sum += byte;
+        }
+        break :blk sum;
+    };
+
+    const Buffer = RingBuffer(16);
+    var buffer = Buffer{};
+
+    var produced: usize = 0;
+    var consumed: usize = 0;
+
+    const producer = std.Thread.spawn(.{}, struct {
+        fn run(buf: *Buffer, total: *usize) void {
+            for (0..ITERS) |i| {
+                while (buf.write_len() == 0) {}
+
+                const slice = buf.write_slice();
+                if (slice.len > 0) {
+                    slice[0] = @truncate(i);
+                    buf.commit(1);
+                    total.* += 1;
+                }
+            }
+        }
+    }.run, .{ &buffer, &produced }) catch @panic("shitthread");
+
+    var checksum: usize = 0;
+
+    const consumer = std.Thread.spawn(.{}, struct {
+        fn run(buf: *Buffer, total: *usize, cksum: *usize) void {
+            for (0..ITERS) |_| {
+                while (buf.read_len() == 0) {}
+
+                const slice = buf.read_slice();
+                if (slice.len > 0) {
+                    const byte = slice[0];
+                    buf.release(1);
+                    cksum.* += byte;
+                    total.* += 1;
+                }
+            }
+        }
+    }.run, .{ &buffer, &consumed, &checksum }) catch @panic("shitthread");
+
+    producer.join();
+    consumer.join();
+
+    const result = .{ produced, consumed, checksum };
+
+    try t.expectEqual(expected_cksum, result[2]);
+    try t.expectEqual(result[0], result[1]);
+}
