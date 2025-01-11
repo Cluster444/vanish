@@ -28,9 +28,8 @@ pub fn RingBuffer(comptime size: u32) type {
         }
 
         pub fn write_slice(self: *Self) []u8 {
-            const rhead = self.head.raw;
-            const rtail = self.tail.raw;
-            const avail = SIZE -% (rhead -% rtail);
+            const rhead = self.head.load(.acquire);
+            const avail = self.write_len();
             const head = rhead & MASK;
             const wrap = SIZE - head;
 
@@ -49,9 +48,8 @@ pub fn RingBuffer(comptime size: u32) type {
         }
 
         pub fn read_slice(self: *Self) []const u8 {
-            const rhead = self.head.raw;
-            const rtail = self.tail.raw;
-            const avail = rhead -% rtail;
+            const rtail = self.tail.load(.acquire);
+            const avail = self.read_len();
             const tail = rtail & MASK;
             const wrap = SIZE - tail;
 
