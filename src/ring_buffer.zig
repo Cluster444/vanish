@@ -41,6 +41,27 @@ pub fn RingBuffer(comptime size: u32) type {
             self.head.store(self.head.raw +% count, .release);
         }
 
+        pub fn write(self: *Self, bytes: []const u8) usize {
+            var slice = self.write_slice();
+            const bytes_to_write = @min(bytes.len, slice.len);
+
+            if (bytes_to_write > 0) {
+                @memcpy(slice[0..bytes_to_write], bytes[0..bytes_to_write]);
+                self.commit(bytes_to_write);
+            }
+
+            return bytes_to_write;
+        }
+
+        pub fn write_all(self: *Self, bytes: []const u8) void {
+            var cursor = bytes;
+
+            while (cursor.len > 0) {
+                const count = self.write(cursor);
+                cursor = cursor[count..];
+            }
+        }
+
         // Consumer Side
         //
         pub fn read_len(self: *Self) usize {
@@ -59,6 +80,27 @@ pub fn RingBuffer(comptime size: u32) type {
         pub fn release(self: *Self, count: usize) void {
             assert(count <= self.read_len());
             self.tail.store(self.tail.raw +% count, .release);
+        }
+
+        pub fn read(self: *Self, bytes: []u8) usize {
+            var slice = self.read_slice();
+            const bytes_to_read = @min(bytes.len, slice.len);
+
+            if (bytes_to_read > 0) {
+                @memcpy(bytes[0..bytes_to_read], slice[0..bytes_to_read]);
+                self.release(bytes_to_read);
+            }
+
+            return bytes_to_read;
+        }
+
+        pub fn read_all(self: *Self, bytes: []u8) void {
+            var cursor = bytes;
+
+            while (bytes.len > 0) {
+                const count = self.read(cursor);
+                cursor = cursor[count..];
+            }
         }
     };
 }
