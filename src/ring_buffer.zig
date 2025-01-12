@@ -1,7 +1,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
-const AtomicSize = std.atomic.Value(usize);
+const AtomSize = std.atomic.Value(usize);
 
 pub fn RingBuffer(comptime size: u32) type {
     std.debug.assert(@popCount(size) == 1);
@@ -9,8 +9,9 @@ pub fn RingBuffer(comptime size: u32) type {
 
     return struct {
         buffer: [size]u8 = undefined,
-        head: AtomicSize align(64) = AtomicSize.init(0),
-        tail: AtomicSize align(64) = AtomicSize.init(0),
+        head: AtomSize align(64) = AtomSize.init(0),
+        tail: AtomSize align(64) = AtomSize.init(0),
+        name: []const u8,
 
         const Self = @This();
         pub const SIZE = size;
@@ -24,10 +25,10 @@ pub fn RingBuffer(comptime size: u32) type {
         // Producer side
         //
         pub fn write_len(self: *Self) usize {
-            return SIZE - self.read_len();
+            return SIZE - self.readable_len();
         }
 
-        pub fn write_slice(self: *Self) []u8 {
+        pub fn writable_slice(self: *Self) []u8 {
             const rhead = self.head.load(.acquire);
             const avail = self.write_len();
             const head = rhead & MASK;
@@ -42,7 +43,7 @@ pub fn RingBuffer(comptime size: u32) type {
         }
 
         pub fn write(self: *Self, bytes: []const u8) usize {
-            var slice = self.write_slice();
+            var slice = self.writable_slice();
             const bytes_to_write = @min(bytes.len, slice.len);
 
             if (bytes_to_write > 0) {
@@ -64,13 +65,13 @@ pub fn RingBuffer(comptime size: u32) type {
 
         // Consumer Side
         //
-        pub fn read_len(self: *Self) usize {
+        pub fn readable_len(self: *Self) usize {
             return self.head.raw -% self.tail.raw;
         }
 
-        pub fn read_slice(self: *Self) []const u8 {
+        pub fn readable_slice(self: *Self) []const u8 {
             const rtail = self.tail.load(.acquire);
-            const avail = self.read_len();
+            const avail = self.readable_len();
             const tail = rtail & MASK;
             const wrap = SIZE - tail;
 
@@ -78,12 +79,12 @@ pub fn RingBuffer(comptime size: u32) type {
         }
 
         pub fn release(self: *Self, count: usize) void {
-            assert(count <= self.read_len());
+            assert(count <= self.readable_len());
             self.tail.store(self.tail.raw +% count, .release);
         }
 
         pub fn read(self: *Self, bytes: []u8) usize {
-            var slice = self.read_slice();
+            var slice = self.readable_slice();
             const bytes_to_read = @min(bytes.len, slice.len);
 
             if (bytes_to_read > 0) {
@@ -97,10 +98,19 @@ pub fn RingBuffer(comptime size: u32) type {
         pub fn read_all(self: *Self, bytes: []u8) void {
             var cursor = bytes;
 
-            while (bytes.len > 0) {
+            while (cursor.len > 0) {
                 const count = self.read(cursor);
                 cursor = cursor[count..];
             }
+        }
+
+        pub fn read_byte(self: *Self) ?u8 {
+            if (self.readable_len() == 0) {
+                return null;
+            }
+            const byte: u8 = self.buffer[self.tail.load(.acquire)];
+            self.release(1);
+            return byte;
         }
     };
 }
@@ -130,7 +140,7 @@ test "RingBuffer concurrent access" {
             for (0..ITERS) |i| {
                 while (buf.write_len() == 0) {}
 
-                const slice = buf.write_slice();
+                const slice = buf.writable_slice();
                 if (slice.len > 0) {
                     slice[0] = @truncate(i);
                     buf.commit(1);
@@ -145,9 +155,9 @@ test "RingBuffer concurrent access" {
     const consumer = std.Thread.spawn(.{}, struct {
         fn run(buf: *Buffer, total: *usize, cksum: *usize) void {
             for (0..ITERS) |_| {
-                while (buf.read_len() == 0) {}
+                while (buf.readable_len() == 0) {}
 
-                const slice = buf.read_slice();
+                const slice = buf.readable_slice();
                 if (slice.len > 0) {
                     const byte = slice[0];
                     buf.release(1);

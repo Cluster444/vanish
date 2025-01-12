@@ -24,3 +24,16 @@ fn memcpy(target: []u8, source: []const u8) void {
         }
     }
 }
+
+pub fn sleep(throttle: *u64) void {
+    std.Thread.sleep(std.time.ms_per_s * throttle.*);
+
+    throttle.* = switch (throttle.*) {
+        1 => 2,
+        2 => 3,
+        3 => 5,
+        5 => 7,
+        7 => 10,
+        else => 20,
+    };
+}
