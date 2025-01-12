@@ -1,6 +1,5 @@
 vanish
 libvanish.dylib
-test
 .DS_Store
 bm_*
 *.o
