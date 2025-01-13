@@ -1,12 +1,12 @@
 const std = @import("std");
 const time = std.time;
 
-const RingBuffer = @import("ring_buffer.zig").RingBuffer;
+const RingBuffer = @import("buffers.zig").RingBuffer;
 
 pub fn main() void {
     const iterations = 10_000_000;
-    const Buffer = RingBuffer(64);
-    var buffer = Buffer{};
+    const Buffer = RingBuffer(64, false);
+    var buffer = Buffer{ .name = "Bench" };
 
     const results = benchmark(&buffer, iterations);
 
@@ -66,7 +66,7 @@ fn benchmark(
         while (i < iterations) : (i += 1) {
             var write_size = op_size[op_size_idx];
             op_size_idx +%= 1;
-            const slice = ring_buffer.write_slice();
+            const slice = ring_buffer.writable_slice();
             if (slice.len > 0) {
                 write_size = @min(slice.len, data.len);
                 @memcpy(slice[0..write_size], data[0..write_size]);
@@ -89,7 +89,7 @@ fn benchmark(
         while (i < iterations) : (i += 1) {
             var read_size = op_size[op_size_idx];
             op_size_idx +%= 1;
-            const slice = ring_buffer.read_slice();
+            const slice = ring_buffer.readable_slice();
             if (slice.len > 0) {
                 read_size = @min(slice.len, data.len);
                 @memcpy(data[0..read_size], slice[0..read_size]);

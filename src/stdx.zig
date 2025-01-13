@@ -3,7 +3,13 @@ const assert = std.debug.assert;
 const copyForwards = std.mem.copyForwards;
 const copyBackwards = std.mem.copyBackwards;
 
-fn memcpy(target: []u8, source: []const u8) void {
+pub fn assertEnum(comptime E: type) void {
+    if (@typeInfo(E) != .@"enum") {
+        @compileError("Expected enum type, got " ++ @typeName(E));
+    }
+}
+
+pub fn memcpy(target: []u8, source: []const u8) void {
     assert(target.len >= source.len);
     assert(target.ptr != source.ptr);
 

@@ -6,29 +6,12 @@ const meta = std.meta;
 const assert = std.debug.assert;
 const indexOf = std.mem.indexOf;
 
+const asc = @import("ascii.zig");
 const stx = @import("stdx.zig");
 const typ = @import("types.zig");
 const Config = typ.Config;
 const State = typ.State;
 const IOPipe = typ.IOPipe;
-
-// zig fmt: off
-// ASCII Codes
-//
-const BACKSPACE  = 0x08;
-const HORIZ_TAB  = 0x09;
-const LINE_FEED  = 0x0A;
-const VERT_TAB   = 0x0B;
-const FORM_FEED  = 0x0C;
-const CAR_RETURN = 0x0D;
-const SHIFT_OUT  = 0x0E;
-const SHIFT_IN   = 0x0F;
-const ESCAPE     = 0x1B;
-const SPACE      = 0x20;
-const DQUOTE     = 0x22;
-const SQUOTE     = 0x27;
-const DELETE     = 0x7F;
-// zig fmt: on
 
 const AnsiCode = union(enum) {
     move_up: u8,
@@ -88,43 +71,12 @@ const Self = @This();
 
 // Setup
 //
-const BlockAllocator = struct {
-    memory: []u8 = undefined,
-    block_count: usize = 0,
-    cursor: usize = 0,
-
-    const BLOCK_SIZE = 16 * 1024;
-
-    pub fn add_blocks(self: *BlockAllocator, count: usize) void {
-        self.block_count += count;
-    }
-
-    pub fn alloc_size(self: *BlockAllocator) usize {
-        return self.block_count * BLOCK_SIZE;
-    }
-
-    pub fn alloc(self: *BlockAllocator, count: usize) []u8 {
-        const size = count * BLOCK_SIZE;
-        const new_cursor = self.cursor + size;
-        defer self.cursor = new_cursor;
-        assert(new_cursor <= self.memory.len);
-        return self.memory[self.cursor..new_cursor];
-    }
-};
-
-var blocks = BlockAllocator{};
-
-const BUILTIN_ARENA_BLOCKS = 1;
-const RUN_BLOCKS = 1;
 
 pub export fn setup(cfg: *Config) void {
-    blocks.add_blocks(RUN_BLOCKS);
-    blocks.add_blocks(BUILTIN_ARENA_BLOCKS);
-    cfg.mem_size = blocks.alloc_size();
+    _ = cfg;
 }
 
-const PROMPT = " 👻 ";
-const PromptState = enum { Prompting, Waiting, Processing };
+pub const PROMPT = " 👻 ";
 
 pub const Builtins = enum {
     exit,
@@ -134,84 +86,67 @@ pub const Builtins = enum {
 
 // Run
 //
-pub export fn run(state: *State) void {
-    var prompt_state: PromptState = .Prompting;
-    var combuf = CommandBuffer{};
+pub export fn run(app: *State) void {
+    var cwd = std.fs.cwd();
 
-    blocks.memory = state.mem();
-    const run_memory = blocks.alloc(RUN_BLOCKS);
-    const run_buffer = heap.FixedBufferAllocator.init(run_memory);
-    _ = run_buffer;
+    switch (app.state) {
+        .Prompting => {
+            const pathbuf = app.arena.alloc(1024);
+            const path = cwd.realpath(".", pathbuf) catch unreachable;
+            app.output.write_all(fs.path.basename(path));
+            app.output.write_all(PROMPT);
+            app.state = .Waiting;
+        },
+        .Waiting => {
+            if (app.input.readable_len() > 0) {
+                const slice = app.combuf.read_from(app.input, app.output);
+                app.output.write_all(slice);
 
-    const builtin_memory = blocks.alloc(BUILTIN_ARENA_BLOCKS);
-    var builtin_buffer = heap.FixedBufferAllocator.init(builtin_memory);
+                if (app.combuf.advance()) {
+                    app.state = .Processing;
+                }
+            } else {}
+        },
+        .Processing => {
+            // Execution order
+            // * Builtins
+            // * Aliases
+            // * Exec Command
 
-    var throttle: u64 = 1;
-    var workdir = std.fs.cwd();
+            var args = ArgsIterator.init(app.combuf.command_slice());
+            const command = args.next_arg().?;
 
-    while (state.running) {
-        defer builtin_buffer.reset();
-        const alloc = builtin_buffer.allocator();
-
-        switch (prompt_state) {
-            .Prompting => {
-                const path = workdir.realpathAlloc(alloc, ".") catch unreachable;
-                state.output.write_all(fs.path.basename(path));
-                state.output.write_all(PROMPT);
-                prompt_state = .Waiting;
-            },
-            .Waiting => {
-                if (state.input.readable_len() > 0) {
-                    throttle = 1;
-                    const slice = combuf.read_from(state.input, state.output);
-                    state.output.write_all(slice);
-
-                    if (combuf.advance()) {
-                        prompt_state = .Processing;
+            blt_blk: {
+                if (meta.stringToEnum(Builtins, command)) |builtin| {
+                    switch (builtin) {
+                        .exit => app.running = false,
+                        .pwd => {
+                            const pathbuf = app.arena.alloc(1024);
+                            const path = cwd.realpath(".", pathbuf) catch unreachable;
+                            app.output.write_all(path);
+                            app.output.write_all("\n");
+                        },
+                        .cd => {
+                            if (args.next_arg()) |reldir| {
+                                const newdir = cwd.openDir(reldir, .{ .iterate = true }) catch |err| {
+                                    std.debug.print("Failed to open dir: {!}\n", .{err});
+                                    break :blt_blk;
+                                };
+                                newdir.setAsCwd() catch |err| {
+                                    std.debug.print("Failed to set cwd: {!}\n", .{err});
+                                    break :blt_blk;
+                                };
+                            }
+                        },
                     }
-                } else {
-                    stx.sleep(&throttle);
-                }
-            },
-            .Processing => {
-                // Execution order
-                // * Builtins
-                // * Aliases
-                // * Exec Command
+                } else {}
+            }
 
-                var args = ArgsIterator.init(combuf.command_slice());
-                const command = args.next_arg().?;
-
-                blt_blk: {
-                    if (meta.stringToEnum(Builtins, command)) |builtin| {
-                        switch (builtin) {
-                            .exit => state.running = false,
-                            .pwd => {
-                                const path = workdir.realpathAlloc(alloc, ".") catch unreachable;
-                                state.output.write_all(path);
-                                state.output.write_all("\n");
-                            },
-                            .cd => {
-                                if (args.next_arg()) |reldir| {
-                                    const newdir = workdir.openDir(reldir, .{ .iterate = true }) catch |err| {
-                                        std.debug.print("Failed to open dir: {!}\n", .{err});
-                                        break :blt_blk;
-                                    };
-                                    newdir.setAsCwd() catch |err| {
-                                        std.debug.print("Failed to set cwd: {!}\n", .{err});
-                                        break :blt_blk;
-                                    };
-                                }
-                            },
-                        }
-                    } else {}
-                }
-
-                prompt_state = .Prompting;
-                combuf.release();
-            },
-        }
+            app.state = .Prompting;
+            app.combuf.release();
+        },
     }
+    // }
 }
 
 const ArgsIterator = struct {
@@ -241,10 +176,10 @@ const ArgsIterator = struct {
             switch (state) {
                 .Unescaped => {
                     switch (b) {
-                        DQUOTE => {
+                        asc.DQUOTE => {
                             state = .EscapedDouble;
                         },
-                        SQUOTE => {
+                        asc.SQUOTE => {
                             state = .EscapedSingle;
                         },
                         ' ', '\t', '\n' => {
@@ -254,12 +189,12 @@ const ArgsIterator = struct {
                     }
                 },
                 .EscapedDouble => {
-                    if (b == DQUOTE) {
+                    if (b == asc.DQUOTE) {
                         state = .Unescaped;
                     }
                 },
                 .EscapedSingle => {
-                    if (b == SQUOTE) {
+                    if (b == asc.SQUOTE) {
                         state = .Unescaped;
                     }
                 },
@@ -274,7 +209,7 @@ const ArgsIterator = struct {
     }
 };
 
-const CommandBuffer = struct {
+pub const CommandBuffer = struct {
     buffer: [SIZE]u8 = undefined,
     head: usize = 0,
     tail: usize = 0,
@@ -283,6 +218,10 @@ const CommandBuffer = struct {
     const State = enum { Waiting, Ready };
 
     const SIZE = 4096;
+
+    pub fn init(self: *CommandBuffer) void {
+        self.reset();
+    }
 
     pub fn reset(self: *CommandBuffer) void {
         self.head = 0;
@@ -305,7 +244,7 @@ const CommandBuffer = struct {
     pub fn read_from(self: *CommandBuffer, in: *IOPipe, out: *IOPipe) []const u8 {
         while (in.read_byte()) |byte| {
             switch (byte) {
-                BACKSPACE, DELETE => {
+                asc.BACKSPACE, asc.DELETE => {
                     if (self.head > self.tail) {
                         AnsiCode.write(.{ .move_left = 1 }, out);
                         AnsiCode.write(.clear_right, out);
@@ -357,7 +296,7 @@ const CommandBuffer = struct {
 
         for (slice) |byte| {
             switch (byte) {
-                LINE_FEED => {
+                asc.LINE_FEED => {
                     self.cursor += 1;
                     return true;
                 },
