@@ -26,7 +26,7 @@ pub const ByteAllocator = struct {
 };
 
 pub fn BlockAllocator(comptime E: type) type {
-    stx.assertEnum(E);
+    stx.assert_enum(E);
 
     return struct {
         memory: []u8 = undefined,
@@ -114,7 +114,7 @@ const BlockData = struct {
 };
 
 fn Blocks(comptime E: type) type {
-    stx.assertEnum(E);
+    stx.assert_enum(E);
 
     const enum_fields = std.meta.fields(E);
     comptime var struct_fields: [enum_fields.len]std.builtin.Type.StructField = undefined;

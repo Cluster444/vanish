@@ -3,7 +3,8 @@ const std = @import("std");
 const buf = @import("buffers.zig");
 const mem = @import("memory.zig");
 const root = @import("root.zig");
-const BlockAllocator = @import("memory.zig").BlockAllocator;
+
+const BlockAllocator = mem.BlockAllocator;
 
 pub const ByteAllocator = mem.ByteAllocator;
 pub const CommandBuffer = root.CommandBuffer;
@@ -24,18 +25,12 @@ pub const Config = extern struct {
 const PromptState = enum(c_int) { Prompting = 1, Waiting, Processing };
 
 pub const State = extern struct {
-    mem_ptr: [*]u8 = undefined,
-    mem_len: usize = 0,
+    arena: *ByteAllocator,
+    combuf: *CommandBuffer,
     input: *IOPipe,
     output: *IOPipe,
-    combuf: *CommandBuffer,
-    arena: *ByteAllocator,
     state: PromptState = .Prompting,
     running: bool,
-
-    pub fn mem(self: *State) []u8 {
-        return self.mem_ptr[0..self.mem_len];
-    }
 };
 
 pub const SetupFn = fn (*Config) void;

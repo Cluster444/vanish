@@ -97,22 +97,26 @@ pub export fn run(app: *State) void {
             app.output.write_all(fs.path.basename(path));
             app.output.write_all(PROMPT);
             app.state = .Waiting;
+            app.combuf.reset();
         },
         .Waiting => {
             if (app.input.readable_len() > 0) {
                 const slice = app.combuf.read_from(app.input, app.output);
                 app.output.write_all(slice);
 
-                if (app.combuf.advance()) {
-                    app.state = .Processing;
+                if (slice.len > 0 and slice[slice.len - 1] == asc.LINE_FEED) {
+                    app.state = if (app.combuf.head == 1) .Prompting else .Processing;
                 }
-            } else {}
+            }
         },
         .Processing => {
             // Execution order
             // * Builtins
             // * Aliases
             // * Exec Command
+
+            const com_slice = std.mem.trim(u8, app.combuf.command_slice(), " \n\r\t");
+            assert(com_slice.len > 0);
 
             var args = ArgsIterator.init(app.combuf.command_slice());
             var argc: usize = 0;
@@ -138,7 +142,8 @@ pub export fn run(app: *State) void {
                             app.output.write_all("\n");
                         },
                         .cd => {
-                            if (args.next_arg()) |reldir| {
+                            if (argc > 1) {
+                                const reldir = argv[1];
                                 const newdir = cwd.openDir(reldir, .{ .iterate = true }) catch |err| {
                                     std.debug.print("Failed to open dir: {!}\n", .{err});
                                     break :blt_blk;
@@ -158,28 +163,18 @@ pub export fn run(app: *State) void {
                     const allocator = arena.allocator();
 
                     var child = std.process.Child.init(argv[0..argc], allocator);
-                    child.stdin_behavior = .Ignore;
-                    child.stdout_behavior = .Pipe;
-                    child.stderr_behavior = .Pipe;
-                    var stdout = std.ArrayList(u8).init(allocator);
-                    var stderr = std.ArrayList(u8).init(allocator);
-
-                    errdefer {
-                        stdout.deinit();
-                        stderr.deinit();
-                    }
+                    child.stdin_behavior = .Inherit;
+                    child.stdout_behavior = .Inherit;
+                    child.stderr_behavior = .Inherit;
 
                     child.spawn() catch unreachable;
-                    child.collectOutput(&stdout, &stderr, 1024 * 1024) catch unreachable;
 
                     const term = child.wait() catch unreachable;
-                    const output = stdout.toOwnedSlice() catch unreachable;
-                    const errout = stderr.toOwnedSlice() catch unreachable;
 
                     switch (term) {
                         .Exited => {
-                            app.output.write_all(output);
-                            app.output.write_all(errout);
+                            // app.output.write_all(output);
+                            // app.output.write_all(errout);
                         },
                         .Signal => {
                             app.output.write_all("Signaled\n");
@@ -195,7 +190,6 @@ pub export fn run(app: *State) void {
             }
 
             app.state = .Prompting;
-            app.combuf.release();
         },
     }
     // }
@@ -264,8 +258,6 @@ const ArgsIterator = struct {
 pub const CommandBuffer = struct {
     buffer: [SIZE]u8 = undefined,
     head: usize = 0,
-    tail: usize = 0,
-    cursor: usize = 0,
 
     const State = enum { Waiting, Ready };
 
@@ -277,86 +269,38 @@ pub const CommandBuffer = struct {
 
     pub fn reset(self: *CommandBuffer) void {
         self.head = 0;
-        self.tail = 0;
-        self.cursor = 0;
-    }
-
-    pub fn readable_slice(self: *CommandBuffer) []const u8 {
-        return self.buffer[self.tail..self.head];
     }
 
     pub fn command_slice(self: *CommandBuffer) []const u8 {
-        return self.buffer[self.tail..self.cursor];
-    }
-
-    pub fn writable_slice(self: *CommandBuffer) []u8 {
-        return self.buffer[self.head..];
+        return self.buffer[0..self.head];
     }
 
     pub fn read_from(self: *CommandBuffer, in: *IOPipe, out: *IOPipe) []const u8 {
-        while (in.read_byte()) |byte| {
+        var begin = self.head;
+
+        while (in.read_byte()) |byte| blk: {
             switch (byte) {
+                // We can bounce out once we get a newline so we can run the command
+                asc.LINE_FEED => {
+                    self.buffer[self.head] = byte;
+                    self.head += 1;
+                    break :blk;
+                },
                 asc.BACKSPACE, asc.DELETE => {
-                    if (self.head > self.tail) {
+                    if (self.head > 0) {
                         AnsiCode.write(.{ .move_left = 1 }, out);
                         AnsiCode.write(.clear_right, out);
+                        begin -= 1;
                         self.head -= 1;
-                        if (self.cursor > self.head) {
-                            self.cursor = self.head;
-                        }
                     }
                 },
                 else => {
                     self.buffer[self.head] = byte;
-                    self.commit(1);
+                    self.head += 1;
                 },
             }
         }
 
-        return self.buffer[self.cursor..self.head];
-    }
-
-    pub fn commit(self: *CommandBuffer, count: usize) void {
-        assert(self.head + count <= SIZE);
-        self.head += count;
-    }
-
-    /// Use after a command has been executed and is
-    /// ready to be removed from the command buffer.
-    ///
-    /// If there was only one command, this will reset
-    /// the buffer, otherwise if there's more input then
-    /// this will move the tail forward until all commands
-    /// are processed.
-    pub fn release(self: *CommandBuffer) void {
-        if (self.cursor == self.head) {
-            self.reset();
-        } else {
-            assert(!std.mem.eql(u8, self.command_slice(), "\n"));
-            self.tail = self.cursor;
-        }
-    }
-
-    /// Move the cursor forward until we run into a newline that
-    /// marks the end of the command.
-    ///
-    /// This will return true if the advance hit a newline and
-    /// is ready to be executed, or false if we want more input.
-    pub fn advance(self: *CommandBuffer) bool {
-        assert(self.head >= self.cursor);
-        const slice = self.buffer[self.cursor..self.head];
-
-        for (slice) |byte| {
-            switch (byte) {
-                asc.LINE_FEED => {
-                    self.cursor += 1;
-                    return true;
-                },
-                else => {},
-            }
-        }
-
-        self.cursor = self.head;
-        return false;
+        return self.buffer[begin..self.head];
     }
 };

@@ -3,9 +3,15 @@ const assert = std.debug.assert;
 const copyForwards = std.mem.copyForwards;
 const copyBackwards = std.mem.copyBackwards;
 
-pub fn assertEnum(comptime E: type) void {
+pub fn assert_enum(comptime E: type) void {
     if (@typeInfo(E) != .@"enum") {
         @compileError("Expected enum type, got " ++ @typeName(E));
+    }
+}
+
+pub fn assert_log2(comptime size: usize) void {
+    if (@popCount(size) != 1) {
+        @compileError("Expected power of 2, got " ++ size);
     }
 }
 
