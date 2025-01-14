@@ -1,6 +1,6 @@
 const std = @import("std");
 const typ = @import("types.zig");
-const stx = @import("stdx.zig");
+const stx = @import("stx.zig");
 const mem = @import("memory.zig");
 const psx = std.posix;
 

@@ -8,7 +8,7 @@ const assert = std.debug.assert;
 const indexOf = std.mem.indexOf;
 
 const asc = @import("ascii.zig");
-const stx = @import("stdx.zig");
+const stx = @import("stx.zig");
 const typ = @import("types.zig");
 const Config = typ.Config;
 const State = typ.State;
