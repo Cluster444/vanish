@@ -3,6 +3,7 @@ const fs = std.fs;
 const heap = std.heap;
 const mem = std.mem;
 const meta = std.meta;
+const psx = std.posix;
 const assert = std.debug.assert;
 const indexOf = std.mem.indexOf;
 
@@ -114,10 +115,20 @@ pub export fn run(app: *State) void {
             // * Exec Command
 
             var args = ArgsIterator.init(app.combuf.command_slice());
-            const command = args.next_arg().?;
+            var argc: usize = 0;
+            var argv: [32][]const u8 = undefined;
+
+            while (args.next_arg()) |arg| {
+                if (argc < 32) {
+                    argv[argc] = arg;
+                    argc += 1;
+                } else {
+                    @panic("No application needs more than 32 args");
+                }
+            }
 
             blt_blk: {
-                if (meta.stringToEnum(Builtins, command)) |builtin| {
+                if (meta.stringToEnum(Builtins, argv[0])) |builtin| {
                     switch (builtin) {
                         .exit => app.running = false,
                         .pwd => {
@@ -139,7 +150,48 @@ pub export fn run(app: *State) void {
                             }
                         },
                     }
-                } else {}
+                } else {
+                    // TODO: All of this needs to go to platform and be handled by
+                    // the platform thread
+                    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                    defer arena.deinit();
+                    const allocator = arena.allocator();
+
+                    var child = std.process.Child.init(argv[0..argc], allocator);
+                    child.stdin_behavior = .Ignore;
+                    child.stdout_behavior = .Pipe;
+                    child.stderr_behavior = .Pipe;
+                    var stdout = std.ArrayList(u8).init(allocator);
+                    var stderr = std.ArrayList(u8).init(allocator);
+
+                    errdefer {
+                        stdout.deinit();
+                        stderr.deinit();
+                    }
+
+                    child.spawn() catch unreachable;
+                    child.collectOutput(&stdout, &stderr, 1024 * 1024) catch unreachable;
+
+                    const term = child.wait() catch unreachable;
+                    const output = stdout.toOwnedSlice() catch unreachable;
+                    const errout = stderr.toOwnedSlice() catch unreachable;
+
+                    switch (term) {
+                        .Exited => {
+                            app.output.write_all(output);
+                            app.output.write_all(errout);
+                        },
+                        .Signal => {
+                            app.output.write_all("Signaled\n");
+                        },
+                        .Stopped => {
+                            app.output.write_all("Stopped\n");
+                        },
+                        .Unknown => {
+                            app.output.write_all("Unknown\n");
+                        },
+                    }
+                }
             }
 
             app.state = .Prompting;
