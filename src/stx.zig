@@ -3,6 +3,15 @@ const assert = std.debug.assert;
 const copyForwards = std.mem.copyForwards;
 const copyBackwards = std.mem.copyBackwards;
 
+pub const CACHE_LINE_SIZE: usize = 64;
+
+pub const HASH_SEED = @import("stx/hash.zig").RAPID_SEED;
+pub const hash = @import("stx/hash.zig").rapid_hash;
+
+pub fn align_cache_line(size: anytype) @TypeOf(size) {
+    return (size + CACHE_LINE_SIZE) & ~CACHE_LINE_SIZE;
+}
+
 pub fn assert_enum(comptime E: type) void {
     if (@typeInfo(E) != .@"enum") {
         @compileError("Expected enum type, got " ++ @typeName(E));
@@ -13,6 +22,19 @@ pub fn assert_log2(comptime size: usize) void {
     if (@popCount(size) != 1) {
         @compileError("Expected power of 2, got " ++ size);
     }
+}
+
+pub fn assert_zeroes(buf: []const u8) void {
+    var success = true;
+    for (buf, 0..) |byte, i| {
+        if (byte != 0) {
+            std.debug.print("{d}\n", .{i});
+            std.debug.print("{x}\n", .{byte});
+            success = false;
+            break;
+        }
+    }
+    assert(success);
 }
 
 pub fn memcpy(target: []u8, source: []const u8) void {

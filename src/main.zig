@@ -6,6 +6,7 @@ const psx = std.posix;
 
 const assert = std.debug.assert;
 
+const AliasMap = typ.AliasMap;
 const ByteAllocator = mem.ByteAllocator;
 const Blocks = typ.Blocks;
 const CommandBuffer = typ.CommandBuffer;
@@ -35,15 +36,20 @@ pub fn main() !void {
     // Allocate Memory
     //
     var memblk = Blocks{ .offset = MEMORY_OFFSET };
+    memblk.reserve(.static, AliasMap, 1);
     memblk.reserve(.static, ByteAllocator, 1);
     memblk.reserve(.buffers, IOPipe, 2);
     memblk.reserve(.buffers, CommandBuffer, 1);
-    memblk.reserve(.arena, u8, 16 * 1024);
+    memblk.reserve(.arena, u8, 1 << 20);
     memblk.commit();
     defer memblk.release();
 
+    // Initialize Memory
+    //
     var static_blk = memblk.block(.static);
+    const aliases = static_blk.create(AliasMap);
     const app_arena = static_blk.create(ByteAllocator);
+    aliases.init();
     app_arena.* = memblk.arena(.arena);
 
     var buffer_blk = memblk.block(.buffers);
@@ -59,12 +65,15 @@ pub fn main() !void {
     // var config: Config = .{};
     // cfg(&config);
 
+    aliases.insert("ls", "ls -FG");
+
     var app: State = .{
         .running = true,
         .input = input,
         .output = output,
         .combuf = cmdbuf,
         .arena = app_arena,
+        .aliases = aliases,
     };
 
     const stdin = std.io.getStdIn();

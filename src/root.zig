@@ -100,34 +100,53 @@ pub export fn run(app: *State) void {
             app.combuf.reset();
         },
         .Waiting => {
-            if (app.input.readable_len() > 0) {
-                const slice = app.combuf.read_from(app.input, app.output);
-                app.output.write_all(slice);
-
-                if (slice.len > 0 and slice[slice.len - 1] == asc.LINE_FEED) {
+            while (app.input.readable_len() > 0) {
+                if (app.combuf.tee(app.input, app.output)) {
                     app.state = if (app.combuf.head == 1) .Prompting else .Processing;
                 }
             }
         },
         .Processing => {
             // Execution order
-            // * Builtins
-            // * Aliases
-            // * Exec Command
+            //
+            // `builtin` builtin
+            // Alias expansion
+            // Exec Path
+            // Exec Func
+            // Exec Builtin
+            // Hash lookup -> Exec Path
+            // Search $PATH -> Exec Path
+            // Else -> Command Not Found
+            //
+            // builtin <builtin> -> Exec builtin (noalias)
+            // command builtin -> Exec builtin or path (noalias)
+            // type -P <file> -> Exec executable on disk
+            //
+            // unalias - delete an alias
+            // unset - delete a function
+            // hash -d <name> delete a hash table entry
 
-            const com_slice = std.mem.trim(u8, app.combuf.command_slice(), " \n\r\t");
-            assert(com_slice.len > 0);
+            assert(app.combuf.head > 0);
 
-            var args = ArgsIterator.init(app.combuf.command_slice());
+            // Alias Expansion
+            //
+            {
+                if (app.combuf.peek_arg()) |arg| {
+                    if (app.aliases.match(arg)) |replacement| {
+                        app.combuf.replace(arg, replacement);
+                    }
+                }
+            }
+
             var argc: usize = 0;
             var argv: [32][]const u8 = undefined;
 
-            while (args.next_arg()) |arg| {
+            while (app.combuf.next_arg()) |arg| {
                 if (argc < 32) {
                     argv[argc] = arg;
                     argc += 1;
                 } else {
-                    @panic("No application needs more than 32 args");
+                    @panic("No application needs more than 32 args! Right!?!?");
                 }
             }
 
@@ -162,20 +181,23 @@ pub export fn run(app: *State) void {
                     defer arena.deinit();
                     const allocator = arena.allocator();
 
+                    app.output.write_all("+ ");
+                    for (argv[0..argc]) |arg| {
+                        app.output.write_byte(' ');
+                        app.output.write_all(arg);
+                    }
+                    app.output.write_byte(asc.LINE_FEED);
+
                     var child = std.process.Child.init(argv[0..argc], allocator);
                     child.stdin_behavior = .Inherit;
                     child.stdout_behavior = .Inherit;
                     child.stderr_behavior = .Inherit;
 
                     child.spawn() catch unreachable;
-
                     const term = child.wait() catch unreachable;
 
                     switch (term) {
-                        .Exited => {
-                            // app.output.write_all(output);
-                            // app.output.write_all(errout);
-                        },
+                        .Exited => {},
                         .Signal => {
                             app.output.write_all("Signaled\n");
                         },
@@ -195,29 +217,100 @@ pub export fn run(app: *State) void {
     // }
 }
 
-const ArgsIterator = struct {
-    command_line: []const u8,
+pub const CommandBuffer = struct {
+    buffer: [SIZE]u8 = undefined,
+    head: usize = 0,
     cursor: usize = 0,
 
-    const State = enum { Unescaped, EscapedSingle, EscapedDouble };
+    const SIZE = 4096;
 
-    pub fn init(command_line: []const u8) ArgsIterator {
-        return .{
-            .command_line = command_line,
-        };
+    pub fn init(self: *CommandBuffer) void {
+        self.head = 0;
+        self.cursor = 0;
+        @memset(self.buffer[0..SIZE], 0);
     }
 
-    pub fn next_arg(self: *ArgsIterator) ?[]const u8 {
-        var state: ArgsIterator.State = .Unescaped;
-        const start = self.cursor;
+    pub fn reset(self: *CommandBuffer) void {
+        @memset(self.buffer[0..self.head], 0);
+        stx.assert_zeroes(self.buffer[0..SIZE]);
+        self.head = 0;
+        self.cursor = 0;
+    }
 
-        if (self.command_line.len == start) {
+    pub fn command_slice(self: *CommandBuffer) []const u8 {
+        return self.buffer[0..self.head];
+    }
+
+    pub fn tee(self: *CommandBuffer, in: *IOPipe, out: *IOPipe) bool {
+        while (in.read_byte()) |byte| {
+            switch (byte) {
+                // We can bounce out once we get a newline so we can run the command
+                asc.LINE_FEED => {
+                    out.write_byte(byte);
+                    return true;
+                },
+                asc.BACKSPACE, asc.DELETE => {
+                    if (self.head > 0) {
+                        // AnsiCode.write(.{ .move_left = 1 }, out);
+                        // AnsiCode.write(.clear_right, out);
+                        self.head -= 1;
+                        out.write_byte(asc.BACKSPACE);
+                    }
+                },
+                else => {
+                    self.buffer[self.head] = byte;
+                    self.head += 1;
+                    out.write_byte(byte);
+                },
+            }
+        }
+
+        return false;
+    }
+
+    pub fn replace(self: *CommandBuffer, from: []const u8, to: []const u8) void {
+        const begin = @intFromPtr(from.ptr) - @intFromPtr(&self.buffer);
+        const from_end = begin + from.len;
+        const to_end = begin + to.len;
+        const expand_by = to.len - from.len;
+
+        if (self.head > from_end) {
+            stx.memcpy(
+                self.buffer[from_end + expand_by .. self.cursor + expand_by],
+                self.buffer[from_end..self.head],
+            );
+        }
+
+        self.head += expand_by;
+        @memcpy(self.buffer[begin..to_end], to);
+    }
+
+    pub fn next_arg(self: *CommandBuffer) ?[]const u8 {
+        if (self.peek_arg()) |arg| {
+            while (self.buffer[self.cursor] == ' ') : (self.cursor += 1) {}
+            self.cursor += arg.len;
+            return arg;
+        } else {
+            return null;
+        }
+    }
+
+    const State = enum { Unescaped, EscapedDouble, EscapedSingle };
+
+    pub fn peek_arg(self: *CommandBuffer) ?[]const u8 {
+        var state: CommandBuffer.State = .Unescaped;
+
+        var begin = self.cursor;
+        while (self.buffer[begin] == ' ') : (begin += 1) {}
+
+        if (self.head == begin) {
             return null;
         }
 
+        // TODO: Handle backslash escapes
         const end: usize = blk: for (
-            self.command_line[self.cursor..],
-            self.cursor..,
+            self.buffer[begin..],
+            begin..,
         ) |b, i| {
             switch (state) {
                 .Unescaped => {
@@ -228,8 +321,11 @@ const ArgsIterator = struct {
                         asc.SQUOTE => {
                             state = .EscapedSingle;
                         },
-                        ' ', '\t', '\n' => {
+                        ' ' => {
                             break :blk i;
+                        },
+                        asc.LINE_FEED => {
+                            unreachable;
                         },
                         else => {},
                     }
@@ -246,61 +342,9 @@ const ArgsIterator = struct {
                 },
             }
         } else {
-            self.cursor = self.command_line.len;
-            return self.command_line[start..];
+            break :blk self.head;
         };
 
-        self.cursor = end + 1;
-        return self.command_line[start..end];
-    }
-};
-
-pub const CommandBuffer = struct {
-    buffer: [SIZE]u8 = undefined,
-    head: usize = 0,
-
-    const State = enum { Waiting, Ready };
-
-    const SIZE = 4096;
-
-    pub fn init(self: *CommandBuffer) void {
-        self.reset();
-    }
-
-    pub fn reset(self: *CommandBuffer) void {
-        self.head = 0;
-    }
-
-    pub fn command_slice(self: *CommandBuffer) []const u8 {
-        return self.buffer[0..self.head];
-    }
-
-    pub fn read_from(self: *CommandBuffer, in: *IOPipe, out: *IOPipe) []const u8 {
-        var begin = self.head;
-
-        while (in.read_byte()) |byte| blk: {
-            switch (byte) {
-                // We can bounce out once we get a newline so we can run the command
-                asc.LINE_FEED => {
-                    self.buffer[self.head] = byte;
-                    self.head += 1;
-                    break :blk;
-                },
-                asc.BACKSPACE, asc.DELETE => {
-                    if (self.head > 0) {
-                        AnsiCode.write(.{ .move_left = 1 }, out);
-                        AnsiCode.write(.clear_right, out);
-                        begin -= 1;
-                        self.head -= 1;
-                    }
-                },
-                else => {
-                    self.buffer[self.head] = byte;
-                    self.head += 1;
-                },
-            }
-        }
-
-        return self.buffer[begin..self.head];
+        return self.buffer[begin..end];
     }
 };

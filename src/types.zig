@@ -4,6 +4,7 @@ const buf = @import("buffers.zig");
 const mem = @import("memory.zig");
 const root = @import("root.zig");
 
+pub const AliasMap = @import("alias_map.zig").AliasMap(64);
 const BlockAllocator = mem.BlockAllocator;
 
 pub const ByteAllocator = mem.ByteAllocator;
@@ -27,6 +28,7 @@ const PromptState = enum(c_int) { Prompting = 1, Waiting, Processing };
 pub const State = extern struct {
     arena: *ByteAllocator,
     combuf: *CommandBuffer,
+    aliases: *AliasMap,
     input: *IOPipe,
     output: *IOPipe,
     state: PromptState = .Prompting,

@@ -32,13 +32,13 @@ pub fn RingBuffer(comptime size: u32, comptime thread_safe: bool) type {
 
         // Producer side
         //
-        pub fn write_len(self: *Self) usize {
+        pub fn writable_len(self: *Self) usize {
             return SIZE - self.readable_len();
         }
 
         pub fn writable_slice(self: *Self) []u8 {
             const rhead = if (thread_safe) self.head.load(.acquire) else self.head.raw;
-            const avail = self.write_len();
+            const avail = self.writable_len();
             const head = rhead & MASK;
             const wrap = SIZE - head;
 
@@ -46,7 +46,7 @@ pub fn RingBuffer(comptime size: u32, comptime thread_safe: bool) type {
         }
 
         pub fn commit(self: *Self, count: usize) void {
-            assert(count <= self.write_len());
+            assert(count <= self.writable_len());
             if (thread_safe) {
                 self.head.store(self.head.raw +% count, .release);
             } else {
@@ -73,6 +73,13 @@ pub fn RingBuffer(comptime size: u32, comptime thread_safe: bool) type {
                 const count = self.write(cursor);
                 cursor = cursor[count..];
             }
+        }
+
+        pub fn write_byte(self: *Self, byte: u8) void {
+            assert(self.writable_len() > 0);
+
+            self.buffer[self.head.raw & MASK] = byte;
+            self.commit(1);
         }
 
         // Consumer Side
@@ -124,7 +131,7 @@ pub fn RingBuffer(comptime size: u32, comptime thread_safe: bool) type {
             if (self.readable_len() == 0) {
                 return null;
             }
-            // const byte: u8 = self.buffer[self.tail.load(.acquire)];
+
             const byte: u8 = self.buffer[self.tail.raw];
             self.release(1);
             return byte;
@@ -156,7 +163,7 @@ test "RingBuffer concurrent access" {
         const producer = std.Thread.spawn(.{}, struct {
             fn run(buf: *Buffer, total: *usize) void {
                 for (0..ITERS) |i| {
-                    while (buf.write_len() == 0) {}
+                    while (buf.writable_len() == 0) {}
 
                     const slice = buf.writable_slice();
                     if (slice.len > 0) {
