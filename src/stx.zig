@@ -49,7 +49,7 @@ pub fn memcpy(target: []u8, source: []const u8) void {
     // Check for no overlap and do a fast memcpy
     // Otherwise fall back to a for loop directional copy
     if (target_end <= source_ptr or source_end <= target_ptr) {
-        @memcpy(target, source);
+        @memcpy(target[0..source.len], source);
     } else {
         if (target_ptr < source_ptr) {
             copyForwards(u8, target, source);

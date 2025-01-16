@@ -168,12 +168,15 @@ pub fn main() void {
 
                 // Alias Expansion
                 //
-                {
+                while (true) {
                     if (combuf.peek_arg()) |arg| {
-                        if (aliases.match(arg)) |replacement| {
+                        if (aliases.find(arg)) |replacement| {
+                            const replacing_self = std.mem.startsWith(u8, replacement, arg);
                             combuf.replace(arg, replacement);
+                            if (!replacing_self) continue;
                         }
                     }
+                    break;
                 }
 
                 command = .{ .argc = 0, .argv = undefined };
@@ -368,7 +371,7 @@ pub const CommandBuffer = struct {
 
         if (self.head > from_end) {
             stx.memcpy(
-                self.buffer[from_end + expand_by .. self.cursor + expand_by],
+                self.buffer[from_end + expand_by .. self.head + expand_by],
                 self.buffer[from_end..self.head],
             );
         }

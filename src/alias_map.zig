@@ -1,53 +1,54 @@
 const std = @import("std");
 const stx = @import("stx.zig");
 
-pub fn AliasMap(comptime key_size: usize) type {
-    stx.assert_log2(key_size);
+const assert = std.debug.assert;
 
+pub fn AliasMap(comptime size: usize) type {
+    stx.assert_log2(size);
+
+    // Stores data in len:str format for the
+    // key and value.
     return struct {
-        buffer: [key_size * stx.CACHE_LINE_SIZE]u8 = undefined,
+        buffer: [size]u8 = undefined,
+        // cache: [64][8]u16 = undefined,
         head: usize = 0,
         // Cache
-        key_idx: [key_size]u16 = undefined,
-        key_len: [key_size]u8 = undefined,
-        val_idx: [key_size]u16 = undefined,
-        val_len: [key_size]u8 = undefined,
 
         const Self = @This();
-        const MASK = key_size - 1;
+        const SIZE = size;
+        const MASK = SIZE - 1;
 
         pub fn init(self: *Self) void {
-            @memset(self.key_len[0..key_size], 0);
             self.head = 0;
         }
 
-        pub fn insert(self: *Self, key: []const u8, val: []const u8) void {
-            const hash = stx.hash(stx.HASH_SEED, key);
-            const idx = hash & MASK;
-            std.debug.assert(self.key_len[idx] == 0);
+        pub fn insert(self: *Self, alias: []const u8, expansion: []const u8) void {
+            assert(alias.len <= 256);
+            assert(expansion.len <= 256);
+            assert(self.buffer.len >= self.head + alias.len + expansion.len + 2);
 
-            @memcpy(self.buffer[self.head..(self.head + key.len)], key);
-            self.key_idx[idx] = @intCast(self.head);
-            self.key_len[idx] = @intCast(key.len);
-            self.head += key.len;
-
-            @memcpy(self.buffer[self.head..(self.head + val.len)], val);
-            self.val_idx[idx] = @intCast(self.head);
-            self.val_len[idx] = @intCast(val.len);
-            self.head += val.len;
-
-            self.head = stx.align_cache_line(self.head);
+            self.buffer[self.head] = @intCast(alias.len);
+            stx.memcpy(self.buffer[self.head + 1 ..], alias);
+            self.buffer[self.head + 1 + alias.len] = @intCast(expansion.len);
+            stx.memcpy(self.buffer[self.head + alias.len + 2 ..], expansion);
+            self.head += alias.len + expansion.len + 2;
         }
 
-        pub fn match(self: *Self, key: []const u8) ?[]u8 {
-            const hash = stx.hash(stx.HASH_SEED, key);
-            const idx = hash & MASK;
+        pub fn find(self: *Self, alias: []const u8) ?[]const u8 {
+            var cursor: usize = 0;
+            while (cursor < SIZE) {
+                const key_len = self.buffer[cursor];
+                const key = self.buffer[cursor + 1 .. cursor + 1 + key_len];
+                const val_len = self.buffer[cursor + 1 + key_len];
 
-            if (self.key_len[idx] != 0) {
-                return self.buffer[self.val_idx[idx] .. self.val_idx[idx] + self.val_len[idx]];
-            } else {
-                return null;
+                if (std.mem.eql(u8, key, alias)) {
+                    return self.buffer[cursor + key_len + 2 .. cursor + key_len + val_len + 2];
+                }
+
+                cursor += key_len + val_len + 2;
             }
+
+            return null;
         }
     };
 }
@@ -57,6 +58,6 @@ const t = std.testing;
 test "AliasMap" {
     var map = AliasMap(16){};
     map.insert("hello", "world");
-    const val = map.command("hello");
+    const val = map.find("hello");
     try t.expectEqualSlices(u8, "world", val);
 }
