@@ -1,5 +1,6 @@
 const std = @import("std");
 const stx = @import("stx.zig");
+const buf = @import("buffers.zig");
 
 const assert = std.debug.assert;
 
@@ -8,7 +9,7 @@ const dbg = std.debug.print;
 pub const BLOCK_ALIGNMENT = 16 * 1024;
 
 pub const ByteAllocator = struct {
-    memory: []u8,
+    memory: []u8 = undefined,
     head: usize = 0,
 
     pub fn alloc(self: *ByteAllocator, size: usize) []u8 {
@@ -95,7 +96,13 @@ const BlockData = struct {
     head: usize,
 
     pub fn create(self: *BlockData, comptime T: type) *T {
-        return @ptrCast(@alignCast(self.alloc(@sizeOf(T)).ptr));
+        const thing: *T = @ptrCast(@alignCast(self.alloc(@sizeOf(T)).ptr));
+        thing.* = T{};
+        if (@hasDecl(T, "init")) {
+            thing.init();
+        }
+
+        return thing;
     }
 
     pub fn alloc(self: *BlockData, count: usize) []u8 {
@@ -137,4 +144,44 @@ fn Blocks(comptime E: type) type {
             .is_tuple = false,
         },
     });
+}
+
+pub const TempMem = RingAllocator(16 * 1024);
+pub var temp: *TempMem = undefined;
+
+pub fn RingAllocator(comptime cap: usize) type {
+    return struct {
+        const Self = @This();
+
+        buffer: buf.RingBuffer(cap, false) = undefined,
+
+        pub fn init(self: *Self) void {
+            self.buffer.init("TempMem");
+        }
+
+        pub fn alloc(self: *Self, bytes: []const u8) []u8 {
+            assert(bytes.len <= cap);
+
+            var avail = self.buffer.writable_len();
+            const writable = self.buffer.writable_slice().len;
+
+            if (writable != avail) {
+                self.buffer.commit(writable);
+                avail -= writable;
+            }
+
+            if (avail < bytes.len) {
+                self.buffer.release(bytes.len - avail);
+            }
+
+            const slice = self.buffer.writable_slice()[0..bytes.len];
+            @memcpy(slice, bytes);
+            self.buffer.commit(bytes.len);
+            return slice[0..bytes.len];
+        }
+
+        pub fn reset(self: *Self) void {
+            self.head = 0;
+        }
+    };
 }
