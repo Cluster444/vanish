@@ -69,6 +69,21 @@ pub fn main() void {
 
     aliases.insert("ls", "ls -FG");
     aliases.insert("ll", "ls -lh");
+    aliases.insert("tree", "tree -C");
+    aliases.insert("tg", "tree --gitignore");
+    aliases.insert("vim", "nvim");
+    aliases.insert("grep", "rg");
+    aliases.insert("ga", "git add");
+    aliases.insert("gaa", "git add .");
+    aliases.insert("gcam", "git commit -am");
+    aliases.insert("gcm", "git commit -m");
+    aliases.insert("gd", "git diff");
+    aliases.insert("gds", "git diff --staged");
+    aliases.insert("gl", "git log --oneline");
+    aliases.insert("gr", "git restore");
+    aliases.insert("grs", "git restore --staged");
+    aliases.insert("gs", "git status --short --branch");
+    aliases.insert("gss", "git diff --name-status --cached");
 
     // Current Path
     const Cwd = struct {
@@ -99,7 +114,7 @@ pub fn main() void {
         builtin: ?Builtins = null,
     } = .{};
 
-    while (running) {
+    run: while (running) {
         defer arena.reset();
 
         switch (state) {
@@ -111,36 +126,63 @@ pub fn main() void {
                 term.sashimi();
             },
             .ReadingInput => {
-                var outbuf = std.BoundedArray(u8, 64).init(0) catch unreachable;
+                // var outbuf = std.BoundedArray(u8, 64).init(0) catch unreachable;
+
                 if (input.read_byte()) |byte| {
                     switch (byte) {
                         asc.CTRL_C => {
-                            outbuf.appendSliceAssumeCapacity("CTRL_C\r\n");
+                            output.writeln("CTRL_C");
                             running = false;
                         },
                         asc.LINE_FEED, asc.CAR_RETURN => {
                             state = if (combuf.head == 0) .Prompting else .Parsing;
-                            outbuf.appendSliceAssumeCapacity("\r\n");
-                            term.cooked();
+                            output.writeln(" ");
                         },
                         asc.BACKSPACE, asc.DELETE => {
                             if (combuf.head > 0) {
-                                outbuf.appendAssumeCapacity(asc.BACKSPACE);
-                                outbuf.appendSliceAssumeCapacity(AnsiCode.code(.clear_right));
+                                output.write_byte(asc.BACKSPACE);
+                                output.write(AnsiCode.code(.clear_right));
                                 combuf.drop(1);
                             }
                         },
                         asc.HORIZ_TAB => {
-                            outbuf.appendAssumeCapacity(0);
+                            // TODO: Completion
+                            // output.write_byte(0);
+                        },
+                        asc.ESCAPE => {
+                            const ack_esc = (input.read_byte() orelse 0) == '[';
+                            if (ack_esc) {
+                                const esc_byte = input.read_byte() orelse 0;
+
+                                switch (esc_byte) {
+                                    'A' => {
+                                        // Key up
+                                    },
+                                    'B' => {
+                                        // Key down
+                                    },
+                                    'C' => {
+                                        // Key right
+                                    },
+                                    'D' => {
+                                        // Key left
+                                    },
+                                    else => {
+                                        output.writeln("Unknown Escape Key");
+                                    },
+                                }
+                            } else {
+                                output.writeln("Bad Escape Sequence");
+                                state = .Prompting;
+                                continue :run;
+                            }
                         },
                         else => {
-                            outbuf.appendAssumeCapacity(byte);
+                            @branchHint(.likely);
+                            // TODO: Completion Hint
+                            output.write_byte(byte);
                             combuf.push(byte);
                         },
-                    }
-
-                    if (outbuf.capacity() > 0) {
-                        output.write(outbuf.constSlice());
                     }
                 }
             },
@@ -148,7 +190,7 @@ pub fn main() void {
                 // Execution order
                 //
                 // `builtin` builtin
-                // Alias expansion
+                // ^ Alias expansion
                 // Exec Path
                 // Exec Func
                 // Exec Builtin
@@ -179,9 +221,64 @@ pub fn main() void {
                     break;
                 }
 
+                const try_cmd = combuf.peek_arg().?;
+
+                if (meta.stringToEnum(Builtins, try_cmd)) |builtin| {
+                    command.builtin = builtin;
+                    state = .ExecutingBuiltin;
+                    continue :run;
+                }
+
+                var slash_pos: usize = 0;
+                while (slash_pos < try_cmd.len) : (slash_pos += 1) {
+                    if (try_cmd[slash_pos] == '/') {
+                        std.debug.print("Found path command", .{});
+                        break;
+                    }
+                } else {
+                    const path_env = psx.getenv("PATH").?;
+
+                    var path_begin: usize = 0;
+                    var path_cursor: usize = 0;
+
+                    path: while (path_cursor < path_env.len) : (path_cursor += 1) {
+                        if (path_env[path_cursor] == ':') {
+                            const path_str = path_env[path_begin..path_cursor];
+                            const path_dir = fs.cwd().openDir(path_str, .{}) catch {
+                                path_begin += path_str.len + 1;
+                                path_cursor += 1;
+                                continue :path;
+                            };
+                            const path_mode = psx.F_OK;
+
+                            psx.faccessat(path_dir.fd, try_cmd, path_mode, 0) catch |err| switch (err) {
+                                psx.AccessError.FileNotFound => {
+                                    path_begin += path_str.len + 1;
+                                    path_cursor += 1;
+                                    continue :path;
+                                },
+                                else => {
+                                    output.writeln("Permission Denied");
+                                    state = .Prompting;
+                                    continue :run;
+                                },
+                            };
+
+                            var new_argv: [psx.PATH_MAX]u8 = undefined;
+                            stx.memcpy(new_argv[0..], path_str);
+                            new_argv[path_str.len] = '/';
+                            combuf.insert(0, new_argv[0..(path_str.len + 1)]);
+                            break :path;
+                        }
+                    } else {
+                        output.writeln("Command not found");
+                        state = .Prompting;
+                        continue :run;
+                    }
+                }
+
                 command = .{ .argc = 0, .argv = undefined };
 
-                // Pargs Command
                 while (combuf.next_arg()) |arg| {
                     if (command.argc < 32) {
                         command.argv[command.argc] = arg;
@@ -191,12 +288,7 @@ pub fn main() void {
                     }
                 }
 
-                if (meta.stringToEnum(Builtins, command.argv[0])) |builtin| {
-                    command.builtin = builtin;
-                    state = .ExecutingBuiltin;
-                } else {
-                    state = .ExecutingCommand;
-                }
+                state = .ExecutingCommand;
             },
             .ExecutingBuiltin => {
                 term.cooked();
@@ -228,6 +320,8 @@ pub fn main() void {
                 term.cooked();
                 defer state = .Prompting;
 
+                // TODO: Rewrite this doing the fork/execve ourselves
+                // so we dont have to deal with zig allocsators
                 var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
                 defer scratch.deinit();
                 const allocator = scratch.allocator();
@@ -283,23 +377,8 @@ const Output = struct {
 
     pub fn writeln(self: *Output, buffer: []const u8) void {
         self.write(buffer);
-        self.write(&[_]u8{asc.LINE_FEED});
+        self.write("\r\n");
     }
-
-    // pub fn writev(self: *Output, buffer: []const u8) void {
-    //     self.vecs[self.head] = .{
-    //         .base = @constCast(buffer.ptr),
-    //         .len = buffer.len,
-    //     };
-    //     self.head += 1;
-    // }
-    //
-    // pub fn flush(self: *Output) void {
-    //     assert(self.head > 0);
-    //     psx.writev(psx.STDOUT_FILENO, self.vecs[0..self.head]) catch unreachable;
-    //     psx.fsync(psx.STDOUT_FILENO) catch unreachable;
-    //     self.head = 0;
-    // }
 };
 
 const Input = struct {
@@ -363,21 +442,28 @@ pub const CommandBuffer = struct {
         }
     }
 
-    pub fn replace(self: *CommandBuffer, from: []const u8, to: []const u8) void {
-        const begin = @intFromPtr(from.ptr) - @intFromPtr(&self.buffer);
-        const from_end = begin + from.len;
-        const to_end = begin + to.len;
-        const expand_by = to.len - from.len;
+    pub fn insert(self: *CommandBuffer, index: usize, source: []const u8) void {
+        assert(self.buffer.len >= self.head + source.len);
+        stx.memcpy(self.buffer[index..][source.len..], self.buffer[index..self.head]);
+        stx.memcpy(self.buffer[index..], source);
+        self.head += source.len;
+    }
 
-        if (self.head > from_end) {
+    pub fn replace(self: *CommandBuffer, target: []const u8, source: []const u8) void {
+        const begin = @intFromPtr(target.ptr) - @intFromPtr(&self.buffer);
+        const target_end = begin + target.len;
+        const source_end = begin + source.len;
+        const delta = source.len - target.len;
+
+        if (self.head > target_end) {
             stx.memcpy(
-                self.buffer[from_end + expand_by .. self.head + expand_by],
-                self.buffer[from_end..self.head],
+                self.buffer[target_end + delta .. self.head + delta],
+                self.buffer[target_end..self.head],
             );
         }
 
-        self.head += expand_by;
-        @memcpy(self.buffer[begin..to_end], to);
+        self.head += delta;
+        @memcpy(self.buffer[begin..source_end], source);
     }
 
     pub fn next_arg(self: *CommandBuffer) ?[]const u8 {
