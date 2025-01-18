@@ -1,19 +1,27 @@
 const std = @import("std");
-const asc = @import("ascii.zig");
-const typ = @import("types.zig");
-const root = @import("root.zig");
 const stx = @import("stx.zig");
 const mem = @import("memory.zig");
 const fs = std.fs;
 const meta = std.meta;
 const psx = std.posix;
 
-const AliasMap = typ.AliasMap;
-const ByteAllocator = mem.ByteAllocator;
-const Blocks = typ.Blocks;
-const Config = typ.Config;
-const IOPipe = typ.IOPipe;
-const State = typ.State;
+const AtomSize = std.atomic.Value(usize);
+
+const MemoryBlocks = enum {
+    static,
+    buffers,
+    arena,
+};
+
+pub const Blocks = BlockAlloc(MemoryBlocks);
+
+pub const TempMem = RingAllocator(16 * 1024);
+
+const Aliases = AliasMap(16 * 1024);
+const BumpAlloc = mem.BumpAlloc;
+const BlockAlloc = mem.BlockAlloc;
+
+const g = @import("global.zig").global;
 
 const assert = std.debug.assert;
 
@@ -27,8 +35,6 @@ const PromptState = enum {
     ExecutingCommand,
 };
 
-pub const Panic = root.Panic;
-
 pub const Builtins = enum {
     exit,
     pwd,
@@ -38,19 +44,18 @@ pub const Builtins = enum {
 pub fn main() void {
     // Terminal Setup
     //
-    var term = &root.term;
-    root.term.init();
-    defer term.cooked();
+    g.term.init();
+    defer g.term.cooked();
 
     // Allocate Memory
     //
     var memblk = Blocks{ .offset = MEMORY_OFFSET };
-    memblk.reserve(.static, AliasMap, 1);
-    memblk.reserve(.static, ByteAllocator, 1);
+    memblk.reserve(.static, Aliases, 1);
+    memblk.reserve(.static, BumpAlloc, 1);
     memblk.reserve(.static, CommandBuffer, 1);
     memblk.reserve(.static, Input, 1);
     memblk.reserve(.static, Output, 1);
-    memblk.reserve(.static, mem.TempMem, 1);
+    memblk.reserve(.static, TempMem, 1);
     memblk.reserve(.arena, u8, 1 << 20);
     memblk.commit();
     defer memblk.release();
@@ -58,15 +63,36 @@ pub fn main() void {
     // Initialize Memory
     //
     var static_blk = memblk.block(.static);
-    const aliases = static_blk.create(AliasMap);
-    const arena = static_blk.create(ByteAllocator);
+    const aliases = static_blk.create(Aliases);
+    const arena = static_blk.create(BumpAlloc);
     const combuf = static_blk.create(CommandBuffer);
     const input = static_blk.create(Input);
     const output = static_blk.create(Output);
-    mem.temp = static_blk.create(mem.TempMem);
+    g.temp = static_blk.create(TempMem);
     aliases.init();
     arena.* = memblk.arena(.arena);
 
+    // Current Path
+    var cwd = struct {
+        dir: fs.Dir = undefined,
+        pathbuf: [psx.PATH_MAX]u8 = undefined,
+        pathlen: usize = 0,
+
+        pub fn refresh(self: *@This(), dir: fs.Dir) void {
+            self.dir = dir;
+            const _path = dir.realpath(".", self.pathbuf[0..]) catch @panic("shitpath");
+            self.pathlen = _path.len;
+        }
+
+        pub fn path(self: *@This()) []const u8 {
+            return self.pathbuf[0..self.pathlen];
+        }
+    }{};
+
+    cwd.refresh(fs.cwd());
+
+    // Load Config
+    //
     aliases.insert("ls", "ls -FG");
     aliases.insert("ll", "ls -lh");
     aliases.insert("tree", "tree -C");
@@ -84,25 +110,6 @@ pub fn main() void {
     aliases.insert("grs", "git restore --staged");
     aliases.insert("gs", "git status --short --branch");
     aliases.insert("gss", "git diff --name-status --cached");
-
-    // Current Path
-    const Cwd = struct {
-        dir: fs.Dir = undefined,
-        pathbuf: [psx.PATH_MAX]u8 = undefined,
-        pathlen: usize = 0,
-
-        pub fn refresh(self: *@This(), dir: fs.Dir) void {
-            self.dir = dir;
-            const _path = dir.realpath(".", self.pathbuf[0..]) catch @panic("shitpath");
-            self.pathlen = _path.len;
-        }
-
-        pub fn path(self: *@This()) []const u8 {
-            return self.pathbuf[0..self.pathlen];
-        }
-    };
-    var cwd = Cwd{};
-    cwd.refresh(fs.cwd());
 
     // Run Loop
     //
@@ -123,7 +130,7 @@ pub fn main() void {
                 output.write(" 👻 ");
                 state = .ReadingInput;
                 combuf.reset();
-                term.sashimi();
+                g.term.sashimi();
             },
             .ReadingInput => {
                 // var outbuf = std.BoundedArray(u8, 64).init(0) catch unreachable;
@@ -291,7 +298,9 @@ pub fn main() void {
                 state = .ExecutingCommand;
             },
             .ExecutingBuiltin => {
-                term.cooked();
+                g.term.cooked();
+                defer state = .Prompting;
+
                 switch (command.builtin.?) {
                     .exit => running = false,
                     .pwd => {
@@ -302,12 +311,10 @@ pub fn main() void {
                             const reldir = command.argv[1];
                             const newdir = cwd.dir.openDir(reldir, .{}) catch |err| {
                                 std.debug.print("Failed to open dir: {!}\n", .{err});
-                                state = .Prompting;
                                 continue;
                             };
                             newdir.setAsCwd() catch |err| {
                                 std.debug.print("Failed to set cwd: {!}\n", .{err});
-                                state = .Prompting;
                                 continue;
                             };
                             cwd.refresh(newdir);
@@ -317,7 +324,7 @@ pub fn main() void {
                 state = .Prompting;
             },
             .ExecutingCommand => {
-                term.cooked();
+                g.term.cooked();
                 defer state = .Prompting;
 
                 // TODO: Rewrite this doing the fork/execve ourselves
@@ -358,54 +365,57 @@ pub fn main() void {
     }
 }
 
-const Output = struct {
-    vecs: [16]psx.iovec_const = undefined,
-    head: u8 = 0,
-    len: usize = 0,
+fn AliasMap(comptime size: usize) type {
+    stx.assert_log2(size);
 
-    pub fn write_byte(self: *Output, byte: u8) void {
-        _ = self;
-        const count = psx.write(psx.STDOUT_FILENO, &[_]u8{byte}) catch unreachable;
-        assert(count == 1);
-    }
+    // Stores data in len:str format for the
+    // key and value.
+    return struct {
+        buffer: [size]u8 = undefined,
+        // cache: [64][8]u16 = undefined,
+        head: usize = 0,
+        // Cache
 
-    pub fn write(self: *Output, buffer: []const u8) void {
-        _ = self;
-        const count = psx.write(psx.STDOUT_FILENO, buffer) catch unreachable;
-        assert(count == buffer.len);
-    }
+        const Self = @This();
+        const SIZE = size;
+        const MASK = SIZE - 1;
 
-    pub fn writeln(self: *Output, buffer: []const u8) void {
-        self.write(buffer);
-        self.write("\r\n");
-    }
-};
-
-const Input = struct {
-    fds: [1]psx.pollfd = undefined,
-
-    pub fn init(self: *Input) void {
-        self.fds[0] = .{ .fd = psx.STDIN_FILENO, .events = psx.POLL.IN, .revents = 0 };
-    }
-
-    pub fn read_byte(self: *Input) ?u8 {
-        const stdin = psx.STDIN_FILENO;
-
-        if (psx.poll(self.fds[0..], 0)) |n| {
-            if (n > 0) {
-                var buf = [_]u8{0};
-                _ = psx.read(stdin, buf[0..1]) catch unreachable;
-                return buf[0];
-            }
-        } else |err| {
-            std.debug.print("stdin: {any}\n", .{err});
+        pub fn init(self: *Self) void {
+            self.head = 0;
         }
 
-        return null;
-    }
-};
+        pub fn insert(self: *Self, alias: []const u8, expansion: []const u8) void {
+            assert(alias.len <= 256);
+            assert(expansion.len <= 256);
+            assert(self.buffer.len >= self.head + alias.len + expansion.len + 2);
 
-pub const CommandBuffer = struct {
+            self.buffer[self.head] = @intCast(alias.len);
+            stx.memcpy(self.buffer[self.head + 1 ..], alias);
+            self.buffer[self.head + 1 + alias.len] = @intCast(expansion.len);
+            stx.memcpy(self.buffer[self.head + alias.len + 2 ..], expansion);
+            self.head += alias.len + expansion.len + 2;
+        }
+
+        pub fn find(self: *Self, alias: []const u8) ?[]const u8 {
+            var cursor: usize = 0;
+            while (cursor < self.head) {
+                const key_len = self.buffer[cursor];
+                const key = self.buffer[cursor + 1 .. cursor + 1 + key_len];
+                const val_len = self.buffer[cursor + 1 + key_len];
+
+                if (std.mem.eql(u8, key, alias)) {
+                    return self.buffer[cursor + key_len + 2 .. cursor + key_len + val_len + 2];
+                }
+
+                cursor += key_len + val_len + 2;
+            }
+
+            return null;
+        }
+    };
+}
+
+const CommandBuffer = struct {
     buffer: [SIZE]u8 = undefined,
     head: usize = 0,
     cursor: usize = 0,
@@ -530,6 +540,319 @@ pub const CommandBuffer = struct {
     }
 };
 
+const Input = struct {
+    fds: [1]psx.pollfd = undefined,
+
+    pub fn init(self: *Input) void {
+        self.fds[0] = .{ .fd = psx.STDIN_FILENO, .events = psx.POLL.IN, .revents = 0 };
+    }
+
+    pub fn read_byte(self: *Input) ?u8 {
+        const stdin = psx.STDIN_FILENO;
+
+        if (psx.poll(self.fds[0..], 0)) |n| {
+            if (n > 0) {
+                var buf = [_]u8{0};
+                _ = psx.read(stdin, buf[0..1]) catch unreachable;
+                return buf[0];
+            }
+        } else |err| {
+            std.debug.print("stdin: {any}\n", .{err});
+        }
+
+        return null;
+    }
+};
+
+const Output = struct {
+    vecs: [16]psx.iovec_const = undefined,
+    head: u8 = 0,
+    len: usize = 0,
+
+    pub fn write_byte(self: *Output, byte: u8) void {
+        _ = self;
+        const count = psx.write(psx.STDOUT_FILENO, &[_]u8{byte}) catch unreachable;
+        assert(count == 1);
+    }
+
+    pub fn write(self: *Output, buffer: []const u8) void {
+        _ = self;
+        const count = psx.write(psx.STDOUT_FILENO, buffer) catch unreachable;
+        assert(count == buffer.len);
+    }
+
+    pub fn writeln(self: *Output, buffer: []const u8) void {
+        self.write(buffer);
+        self.write("\r\n");
+    }
+};
+
+pub fn RingAllocator(comptime cap: usize) type {
+    return struct {
+        const Self = @This();
+
+        buffer: RingBuffer(cap, false) = undefined,
+
+        pub fn init(self: *Self) void {
+            self.buffer.init("TempMem");
+        }
+
+        pub fn alloc(self: *Self, bytes: []const u8) []u8 {
+            assert(bytes.len <= cap);
+
+            var avail = self.buffer.writable_len();
+            const writable = self.buffer.writable_slice().len;
+
+            if (writable != avail) {
+                self.buffer.commit(writable);
+                avail -= writable;
+            }
+
+            if (avail < bytes.len) {
+                self.buffer.release(bytes.len - avail);
+            }
+
+            const slice = self.buffer.writable_slice()[0..bytes.len];
+            @memcpy(slice, bytes);
+            self.buffer.commit(bytes.len);
+            return slice[0..bytes.len];
+        }
+
+        pub fn reset(self: *Self) void {
+            self.head = 0;
+        }
+    };
+}
+
+pub fn RingBuffer(comptime size: u32, comptime thread_safe: bool) type {
+    std.debug.assert(@popCount(size) == 1);
+    std.debug.assert(size > 1);
+
+    const alignment = if (thread_safe) 64 else @alignOf(AtomSize);
+
+    return struct {
+        buffer: [size]u8 = undefined,
+        head: AtomSize align(alignment) = AtomSize.init(0),
+        tail: AtomSize align(alignment) = AtomSize.init(0),
+        name: []const u8,
+
+        const Self = @This();
+        pub const SIZE = size;
+        const MASK = size - 1;
+
+        pub fn init(self: *Self, name: []const u8) void {
+            self.name = name;
+            self.reset();
+        }
+
+        pub fn reset(self: *Self) void {
+            self.head.raw = 0;
+            self.tail.raw = 0;
+        }
+
+        // Producer side
+        //
+        pub fn writable_len(self: *Self) usize {
+            return SIZE - self.readable_len();
+        }
+
+        pub fn writable_slice(self: *Self) []u8 {
+            const rhead = if (thread_safe) self.head.load(.acquire) else self.head.raw;
+            const avail = self.writable_len();
+            const head = rhead & MASK;
+            const wrap = SIZE - head;
+
+            return self.buffer[head..(head +% @min(avail, wrap))];
+        }
+
+        pub fn commit(self: *Self, count: usize) void {
+            assert(count <= self.writable_len());
+            if (thread_safe) {
+                self.head.store(self.head.raw +% count, .release);
+            } else {
+                self.head.raw +%= count;
+            }
+        }
+
+        pub fn write(self: *Self, bytes: []const u8) usize {
+            var slice = self.writable_slice();
+            const bytes_to_write = @min(bytes.len, slice.len);
+
+            if (bytes_to_write > 0) {
+                @memcpy(slice[0..bytes_to_write], bytes[0..bytes_to_write]);
+                self.commit(bytes_to_write);
+            }
+
+            return bytes_to_write;
+        }
+
+        pub fn write_all(self: *Self, bytes: []const u8) void {
+            var cursor = bytes;
+
+            while (cursor.len > 0) {
+                const count = self.write(cursor);
+                cursor = cursor[count..];
+            }
+        }
+
+        pub fn write_byte(self: *Self, byte: u8) void {
+            assert(self.writable_len() > 0);
+
+            self.buffer[self.head.raw & MASK] = byte;
+            self.commit(1);
+        }
+
+        // Consumer Side
+        //
+        pub fn readable_len(self: *Self) usize {
+            return self.head.raw -% self.tail.raw;
+        }
+
+        pub fn readable_slice(self: *Self) []const u8 {
+            const rtail = if (thread_safe) self.tail.load(.acquire) else self.tail.raw;
+            const avail = self.readable_len();
+            const tail = rtail & MASK;
+            const wrap = SIZE - tail;
+
+            return self.buffer[tail..(tail +% @min(avail, wrap))];
+        }
+
+        pub fn release(self: *Self, count: usize) void {
+            assert(count <= self.readable_len());
+            if (thread_safe) {
+                self.tail.store(self.tail.raw +% count, .release);
+            } else {
+                self.tail.raw +%= count;
+            }
+        }
+
+        pub fn read(self: *Self, bytes: []u8) usize {
+            var slice = self.readable_slice();
+            const bytes_to_read = @min(bytes.len, slice.len);
+
+            if (bytes_to_read > 0) {
+                @memcpy(bytes[0..bytes_to_read], slice[0..bytes_to_read]);
+                self.release(bytes_to_read);
+            }
+
+            return bytes_to_read;
+        }
+
+        pub fn read_all(self: *Self, bytes: []u8) void {
+            var cursor = bytes;
+
+            while (cursor.len > 0) {
+                const count = self.read(cursor);
+                cursor = cursor[count..];
+            }
+        }
+
+        pub fn read_byte(self: *Self) ?u8 {
+            if (self.readable_len() == 0) {
+                return null;
+            }
+
+            const byte: u8 = self.buffer[self.tail.raw];
+            self.release(1);
+            return byte;
+        }
+    };
+}
+
+const t = std.testing;
+
+test "RingBuffer concurrent access" {
+    const ITERS = 654321;
+
+    const expected_cksum: usize = blk: {
+        var sum: usize = 0;
+        for (0..ITERS) |i| {
+            const byte: u8 = @truncate(i);
+            sum += byte;
+        }
+        break :blk sum;
+    };
+
+    inline for (.{ 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024 }) |size| {
+        const Buffer = RingBuffer(size, true);
+        var buffer = Buffer{ .name = "Test" };
+
+        var produced: usize = 0;
+        var consumed: usize = 0;
+
+        const producer = std.Thread.spawn(.{}, struct {
+            fn run(buf: *Buffer, total: *usize) void {
+                for (0..ITERS) |i| {
+                    while (buf.writable_len() == 0) {}
+
+                    const slice = buf.writable_slice();
+                    if (slice.len > 0) {
+                        slice[0] = @truncate(i);
+                        buf.commit(1);
+                        total.* += 1;
+                    }
+                }
+            }
+        }.run, .{ &buffer, &produced }) catch @panic("shitthread");
+
+        var checksum: usize = 0;
+
+        const consumer = std.Thread.spawn(.{}, struct {
+            fn run(buf: *Buffer, total: *usize, cksum: *usize) void {
+                for (0..ITERS) |_| {
+                    while (buf.readable_len() == 0) {}
+
+                    const slice = buf.readable_slice();
+                    if (slice.len > 0) {
+                        const byte = slice[0];
+                        buf.release(1);
+                        cksum.* += byte;
+                        total.* += 1;
+                    }
+                }
+            }
+        }.run, .{ &buffer, &consumed, &checksum }) catch @panic("shitthread");
+
+        producer.join();
+        consumer.join();
+
+        const result = .{ produced, consumed, checksum };
+
+        try t.expectEqual(expected_cksum, result[2]);
+        try t.expectEqual(result[0], result[1]);
+    }
+}
+
+// zig fmt: off
+// ASCII Codes
+//
+const asc = struct {
+    const NULL       = 0x00;
+    const START_HEAD = 0x01;
+    const START_TEXT = 0x02;
+    const END_TEXT   = 0x03;
+    const END_TRANSM = 0x04;
+    const ENQUIRY    = 0x05;
+    const ACK        = 0x06;
+    const BELL       = 0x07;
+    const BACKSPACE  = 0x08;
+    const HORIZ_TAB  = 0x09;
+    const LINE_FEED  = 0x0A;
+    const VERT_TAB   = 0x0B;
+    const FORM_FEED  = 0x0C;
+    const CAR_RETURN = 0x0D;
+    const SHIFT_OUT  = 0x0E;
+    const SHIFT_IN   = 0x0F;
+    const ESCAPE     = 0x1B;
+    const SPACE      = 0x20;
+    const DQUOTE     = 0x22;
+    const SQUOTE     = 0x27;
+    const DELETE     = 0x7F;
+    const CTRL_C     = END_TEXT;
+};
+
+// zig fmt: on
+
 const AnsiCode = union(enum) {
     move_up: u8,
     move_down: u8,
@@ -579,6 +902,6 @@ const AnsiCode = union(enum) {
     fn format(comptime fmt: []const u8, args: anytype) []const u8 {
         var buffer: [16]u8 = undefined;
         const res = std.fmt.bufPrint(&buffer, fmt, args) catch unreachable;
-        return mem.temp.alloc(res);
+        return g.temp.alloc(res);
     }
 };

@@ -1,6 +1,5 @@
 const std = @import("std");
 const stx = @import("stx.zig");
-const buf = @import("buffers.zig");
 
 const assert = std.debug.assert;
 
@@ -8,11 +7,11 @@ const dbg = std.debug.print;
 
 pub const BLOCK_ALIGNMENT = 16 * 1024;
 
-pub const ByteAllocator = struct {
+pub const BumpAlloc = struct {
     memory: []u8 = undefined,
     head: usize = 0,
 
-    pub fn alloc(self: *ByteAllocator, size: usize) []u8 {
+    pub fn alloc(self: *BumpAlloc, size: usize) []u8 {
         assert(self.memory.len >= self.head + size);
 
         const begin = self.head;
@@ -21,12 +20,12 @@ pub const ByteAllocator = struct {
         return self.memory[begin..end];
     }
 
-    pub fn reset(self: *ByteAllocator) void {
+    pub fn reset(self: *BumpAlloc) void {
         self.head = 0;
     }
 };
 
-pub fn BlockAllocator(comptime E: type) type {
+pub fn BlockAlloc(comptime E: type) type {
     stx.assert_enum(E);
 
     return struct {
@@ -82,10 +81,10 @@ pub fn BlockAllocator(comptime E: type) type {
             return &@field(self.blocks, @tagName(blk_grp));
         }
 
-        pub fn arena(self: *Self, comptime blk_grp: E) ByteAllocator {
+        pub fn arena(self: *Self, comptime blk_grp: E) BumpAlloc {
             var blk = self.block(blk_grp);
             const memory = blk.alloc_remains();
-            return ByteAllocator{ .memory = memory };
+            return BumpAlloc{ .memory = memory };
         }
     };
 }
@@ -144,44 +143,4 @@ fn Blocks(comptime E: type) type {
             .is_tuple = false,
         },
     });
-}
-
-pub const TempMem = RingAllocator(16 * 1024);
-pub var temp: *TempMem = undefined;
-
-pub fn RingAllocator(comptime cap: usize) type {
-    return struct {
-        const Self = @This();
-
-        buffer: buf.RingBuffer(cap, false) = undefined,
-
-        pub fn init(self: *Self) void {
-            self.buffer.init("TempMem");
-        }
-
-        pub fn alloc(self: *Self, bytes: []const u8) []u8 {
-            assert(bytes.len <= cap);
-
-            var avail = self.buffer.writable_len();
-            const writable = self.buffer.writable_slice().len;
-
-            if (writable != avail) {
-                self.buffer.commit(writable);
-                avail -= writable;
-            }
-
-            if (avail < bytes.len) {
-                self.buffer.release(bytes.len - avail);
-            }
-
-            const slice = self.buffer.writable_slice()[0..bytes.len];
-            @memcpy(slice, bytes);
-            self.buffer.commit(bytes.len);
-            return slice[0..bytes.len];
-        }
-
-        pub fn reset(self: *Self) void {
-            self.head = 0;
-        }
-    };
 }
