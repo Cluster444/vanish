@@ -7,20 +7,6 @@ pub const global = @This();
 pub var term: Term = .{};
 pub var temp: *main.TempMem = undefined;
 
-pub const Panic = struct {
-    pub fn call(msg: []const u8, stack_trace: ?*std.builtin.StackTrace, ret_addr: ?usize) noreturn {
-        global.term.cooked();
-        std.debug.defaultPanic(msg, stack_trace, ret_addr);
-    }
-
-    pub const sentinelMismatch = std.debug.FormattedPanic.sentinelMismatch;
-    pub const unwrapError = std.debug.FormattedPanic.unwrapError;
-    pub const outOfBounds = std.debug.FormattedPanic.outOfBounds;
-    pub const startGreaterThanEnd = std.debug.FormattedPanic.startGreaterThanEnd;
-    pub const inactiveUnionField = std.debug.FormattedPanic.inactiveUnionField;
-    pub const messages = std.debug.FormattedPanic.messages;
-};
-
 const Term = struct {
     welldone: psx.termios = undefined,
     rare: psx.termios = undefined,

@@ -41,6 +41,20 @@ pub const Builtins = enum {
     cd,
 };
 
+pub const Panic = struct {
+    pub fn call(msg: []const u8, stack_trace: ?*std.builtin.StackTrace, ret_addr: ?usize) noreturn {
+        g.term.cooked();
+        std.debug.defaultPanic(msg, stack_trace, ret_addr);
+    }
+
+    pub const sentinelMismatch = std.debug.FormattedPanic.sentinelMismatch;
+    pub const unwrapError = std.debug.FormattedPanic.unwrapError;
+    pub const outOfBounds = std.debug.FormattedPanic.outOfBounds;
+    pub const startGreaterThanEnd = std.debug.FormattedPanic.startGreaterThanEnd;
+    pub const inactiveUnionField = std.debug.FormattedPanic.inactiveUnionField;
+    pub const messages = std.debug.FormattedPanic.messages;
+};
+
 pub fn main() void {
     // Terminal Setup
     //
