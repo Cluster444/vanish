@@ -92,18 +92,35 @@ pub fn main() void {
         pathbuf: [psx.PATH_MAX]u8 = undefined,
         pathlen: usize = 0,
 
+        const Self = @This();
+
+        pub fn init(self: *Self, dir: fs.Dir) void {
+            self.dir = dir.openDir(".", .{ .iterate = true }) catch unreachable;
+            self.refresh(self.dir);
+        }
+
         pub fn refresh(self: *@This(), dir: fs.Dir) void {
             self.dir = dir;
             const _path = dir.realpath(".", self.pathbuf[0..]) catch @panic("shitpath");
             self.pathlen = _path.len;
         }
 
+        pub fn chdir(self: *@This(), reldir: []const u8) !void {
+            var newdir = try self.dir.openDir(reldir, .{ .iterate = true });
+            errdefer newdir.close();
+
+            try psx.fchdir(newdir.fd);
+        }
+
         pub fn path(self: *@This()) []const u8 {
             return self.pathbuf[0..self.pathlen];
         }
-    }{};
 
-    cwd.refresh(fs.cwd());
+        pub fn iterator(self: *@This()) fs.Dir.Iterator {
+            return self.dir.iterate();
+        }
+    }{};
+    cwd.init(fs.cwd());
 
     // Load Config
     //
@@ -129,11 +146,7 @@ pub fn main() void {
     //
     var state: PromptState = .Prompting;
     var running = true;
-    var command: struct {
-        argc: u8 = 0,
-        argv: [32][]const u8 = undefined,
-        builtin: ?Builtins = null,
-    } = .{};
+    var command: Command = .{};
 
     run: while (running) {
         defer arena.reset();
@@ -147,8 +160,6 @@ pub fn main() void {
                 g.term.sashimi();
             },
             .ReadingInput => {
-                // var outbuf = std.BoundedArray(u8, 64).init(0) catch unreachable;
-
                 if (input.read_byte()) |byte| {
                     switch (byte) {
                         asc.CTRL_C => {
@@ -167,8 +178,78 @@ pub fn main() void {
                             }
                         },
                         asc.HORIZ_TAB => {
-                            // TODO: Completion
-                            // output.write_byte(0);
+                            // :Completions
+                            //
+                            var tmp_cmd: Command = .{};
+
+                            var args_iter = combuf.iterator();
+                            while (args_iter.next()) |arg| {
+                                if (tmp_cmd.argc < 32) {
+                                    tmp_cmd.argv[tmp_cmd.argc] = arg;
+                                    tmp_cmd.argc += 1;
+                                } else {
+                                    @panic("No application needs more than 32 args! Right!?!?");
+                                }
+                            }
+
+                            {
+                                output.write(AnsiCode.code(.save));
+
+                                const prefix = tmp_cmd.argv[tmp_cmd.argc - 1];
+                                var completions: usize = 0;
+                                var extend_buf: [256]u8 = undefined;
+                                var extend: []u8 = extend_buf[0..256];
+                                var first = true;
+                                var dir_iter = cwd.iterator();
+                                output.write(AnsiCode.code(.{ .move_down = 1 }));
+                                output.write("\r");
+                                output.write(AnsiCode.code(.clear_line));
+                                while (dir_iter.next() catch null) |entry| {
+                                    if (std.mem.startsWith(u8, entry.name, prefix)) {
+                                        const completion = std.fs.path.basename(entry.name);
+                                        if (extend.len > 0) {
+                                            const ending = completion[prefix.len..];
+                                            if (first) {
+                                                first = false;
+                                                stx.memcpy(extend_buf[0..], ending);
+                                                extend = extend_buf[0..ending.len];
+                                            } else {
+                                                const end = @min(extend.len, ending.len);
+                                                // std.debug.print("Extend len: {d} / Ending len: {d}\r\n", .{ extend.len, ending.len });
+                                                // std.debug.print("End: {d}\n", .{end});
+                                                for (0..end) |idx| {
+                                                    if (extend[idx] != ending[idx]) {
+                                                        // std.debug.print("idx: {d}\r\n", .{idx});
+                                                        extend = extend[0..idx];
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        completions += 1;
+                                        output.write(completion);
+                                        output.write_byte(asc.HORIZ_TAB);
+                                    }
+                                }
+
+                                if (completions == 1) {
+                                    output.write("\r");
+                                    output.write(AnsiCode.code(.clear_line));
+                                }
+
+                                output.write(AnsiCode.code(.restore));
+                                if (extend.len > 0) {
+                                    combuf.insert(combuf.head, extend);
+                                    output.write(extend);
+
+                                    if (completions == 1) {
+                                        // TODO: If the completion is a directory, append a slash
+                                        // instead of a space, and then seraching in the subdirectory
+                                        combuf.insert(combuf.head, " ");
+                                        output.write_byte(' ');
+                                    }
+                                }
+                            }
                         },
                         asc.ESCAPE => {
                             const ack_esc = (input.read_byte() orelse 0) == '[';
@@ -229,10 +310,11 @@ pub fn main() void {
 
                 assert(combuf.head > 0);
 
+                var args_iter = combuf.iterator();
                 // Alias Expansion
                 //
                 while (true) {
-                    if (combuf.peek_arg()) |arg| {
+                    if (args_iter.peek()) |arg| {
                         if (aliases.find(arg)) |replacement| {
                             const replacing_self = std.mem.startsWith(u8, replacement, arg);
                             combuf.replace(arg, replacement);
@@ -242,7 +324,7 @@ pub fn main() void {
                     break;
                 }
 
-                const try_cmd = combuf.peek_arg().?;
+                const try_cmd = args_iter.peek().?;
 
                 if (meta.stringToEnum(Builtins, try_cmd)) |builtin| {
                     command.builtin = builtin;
@@ -300,7 +382,8 @@ pub fn main() void {
 
                 command = .{ .argc = 0, .argv = undefined };
 
-                while (combuf.next_arg()) |arg| {
+                // args_iter.reset();
+                while (args_iter.next()) |arg| {
                     if (command.argc < 32) {
                         command.argv[command.argc] = arg;
                         command.argc += 1;
@@ -323,15 +406,10 @@ pub fn main() void {
                     .cd => {
                         if (command.argc > 1) {
                             const reldir = command.argv[1];
-                            const newdir = cwd.dir.openDir(reldir, .{}) catch |err| {
+                            cwd.chdir(reldir) catch |err| {
                                 std.debug.print("Failed to open dir: {!}\n", .{err});
-                                continue;
+                                continue :run;
                             };
-                            newdir.setAsCwd() catch |err| {
-                                std.debug.print("Failed to set cwd: {!}\n", .{err});
-                                continue;
-                            };
-                            cwd.refresh(newdir);
                         }
                     },
                 }
@@ -429,16 +507,21 @@ fn AliasMap(comptime size: usize) type {
     };
 }
 
+const Command = struct {
+    argv: [32][]const u8 = undefined,
+    argc: u8 = 0,
+    builtin: ?Builtins = null,
+};
+
 const CommandBuffer = struct {
     buffer: [SIZE]u8 = undefined,
     head: usize = 0,
-    cursor: usize = 0,
+    version: usize = 0,
 
     const SIZE = 4096;
 
     pub fn init(self: *CommandBuffer) void {
         self.head = 0;
-        self.cursor = 0;
         @memset(self.buffer[0..SIZE], 0);
     }
 
@@ -446,7 +529,6 @@ const CommandBuffer = struct {
         @memset(self.buffer[0..self.head], 0);
         stx.assert_zeroes(self.buffer[0..SIZE]);
         self.head = 0;
-        self.cursor = 0;
     }
 
     pub fn command_slice(self: *CommandBuffer) []const u8 {
@@ -471,6 +553,7 @@ const CommandBuffer = struct {
         stx.memcpy(self.buffer[index..][source.len..], self.buffer[index..self.head]);
         stx.memcpy(self.buffer[index..], source);
         self.head += source.len;
+        self.version += 1;
     }
 
     pub fn replace(self: *CommandBuffer, target: []const u8, source: []const u8) void {
@@ -488,70 +571,101 @@ const CommandBuffer = struct {
 
         self.head += delta;
         @memcpy(self.buffer[begin..source_end], source);
+        self.version += 1;
     }
 
-    pub fn next_arg(self: *CommandBuffer) ?[]const u8 {
-        if (self.peek_arg()) |arg| {
-            while (self.buffer[self.cursor] == ' ') : (self.cursor += 1) {}
-            self.cursor += arg.len;
-            return arg;
-        } else {
-            return null;
-        }
-    }
-
-    const State = enum { Unescaped, EscapedDouble, EscapedSingle };
-
-    pub fn peek_arg(self: *CommandBuffer) ?[]const u8 {
-        var state: CommandBuffer.State = .Unescaped;
-
-        var begin = self.cursor;
-        while (self.buffer[begin] == ' ') : (begin += 1) {}
-
-        if (self.head == begin) {
-            return null;
-        }
-
-        // TODO: Handle backslash escapes
-        const end: usize = blk: for (
-            self.buffer[begin..],
-            begin..,
-        ) |b, i| {
-            switch (state) {
-                .Unescaped => {
-                    switch (b) {
-                        asc.DQUOTE => {
-                            state = .EscapedDouble;
-                        },
-                        asc.SQUOTE => {
-                            state = .EscapedSingle;
-                        },
-                        ' ' => {
-                            break :blk i;
-                        },
-                        asc.LINE_FEED => {
-                            unreachable;
-                        },
-                        else => {},
-                    }
-                },
-                .EscapedDouble => {
-                    if (b == asc.DQUOTE) {
-                        state = .Unescaped;
-                    }
-                },
-                .EscapedSingle => {
-                    if (b == asc.SQUOTE) {
-                        state = .Unescaped;
-                    }
-                },
-            }
-        } else {
-            break :blk self.head;
+    pub fn iterator(self: *CommandBuffer) Iterator {
+        return .{
+            .combuf = self,
+            .cursor = 0,
+            .buffer = self.buffer[0..self.head],
+            .version = self.version,
         };
-
-        return self.buffer[begin..end];
     }
+
+    pub fn debug(self: *CommandBuffer) void {
+        std.debug.print("Buffer: {s}\n", .{self.buffer[0..self.head]});
+    }
+
+    pub const Iterator = struct {
+        const State = enum { Unescaped, EscapedDouble, EscapedSingle };
+
+        combuf: *CommandBuffer,
+        buffer: []const u8,
+        cursor: usize = 0,
+        version: usize = 0,
+
+        pub fn next(self: *Iterator) ?[]const u8 {
+            if (self.peek()) |arg| {
+                while (self.buffer[self.cursor] == ' ') : (self.cursor += 1) {}
+                self.cursor += arg.len;
+                return arg;
+            } else {
+                return null;
+            }
+        }
+
+        fn refresh(self: *Iterator) void {
+            self.buffer = self.combuf.buffer[0..self.combuf.head];
+            self.version = self.combuf.version;
+            self.cursor = 0;
+        }
+
+        pub fn peek(self: *Iterator) ?[]const u8 {
+            if (self.version != self.combuf.version) {
+                self.refresh();
+            }
+
+            var state: Iterator.State = .Unescaped;
+
+            var begin = self.cursor;
+            if (self.buffer.len == begin) {
+                return null;
+            }
+
+            while (self.buffer[begin] == ' ') : (begin += 1) {}
+
+            // TODO: Handle backslash escapes
+            const end: usize = blk: for (
+                self.buffer[begin..],
+                begin..,
+            ) |b, i| {
+                switch (state) {
+                    .Unescaped => {
+                        switch (b) {
+                            asc.DQUOTE => {
+                                state = .EscapedDouble;
+                            },
+                            asc.SQUOTE => {
+                                state = .EscapedSingle;
+                            },
+                            ' ' => {
+                                break :blk i;
+                            },
+                            asc.LINE_FEED => {
+                                unreachable;
+                            },
+                            else => {},
+                        }
+                    },
+                    .EscapedDouble => {
+                        if (b == asc.DQUOTE) {
+                            state = .Unescaped;
+                        }
+                    },
+                    .EscapedSingle => {
+                        if (b == asc.SQUOTE) {
+                            state = .Unescaped;
+                        }
+                    },
+                }
+            } else {
+                break :blk self.buffer.len;
+            };
+
+            return self.buffer[begin..end];
+        }
+    };
 };
 
 const Input = struct {
@@ -611,22 +725,30 @@ pub fn RingAllocator(comptime cap: usize) type {
             self.buffer.init("TempMem");
         }
 
-        pub fn alloc(self: *Self, bytes: []const u8) []u8 {
-            assert(bytes.len <= cap);
+        pub fn alloc(self: *Self, count: usize) []u8 {
+            assert(count <= cap);
 
-            var avail = self.buffer.writable_len();
-            const writable = self.buffer.writable_slice().len;
+            var writable = self.buffer.writable_slice().len;
 
-            if (writable != avail) {
+            if (count > writable) {
                 self.buffer.commit(writable);
-                avail -= writable;
             }
 
-            if (avail < bytes.len) {
-                self.buffer.release(bytes.len - avail);
+            writable = self.buffer.writable_slice().len;
+
+            if (count > writable) {
+                self.buffer.release(count - writable);
             }
 
-            const slice = self.buffer.writable_slice()[0..bytes.len];
+            const result = self.buffer.writable_slice()[0..count];
+            self.buffer.commit(count);
+            return result;
+        }
+
+        pub fn store(self: *Self, bytes: []const u8) []u8 {
+            assert(bytes.len <= cap);
+            const slice = self.alloc(bytes.len);
+
             @memcpy(slice, bytes);
             self.buffer.commit(bytes.len);
             return slice[0..bytes.len];
@@ -875,6 +997,8 @@ const AnsiCode = union(enum) {
     move_begin_up: u8,
     move_begin_down: u8,
     move_col: u8,
+    scroll_up: u8,
+    scroll_down: u8,
     home,
     clear_up,
     clear_down,
@@ -882,7 +1006,6 @@ const AnsiCode = union(enum) {
     clear_right,
     clear_left,
     clear_line,
-    scroll_up,
     save,
     restore,
 
@@ -899,6 +1022,8 @@ const AnsiCode = union(enum) {
             .move_begin_up   => |n| return format(CSI ++ "{d}E", .{n}),
             .move_begin_down => |n| return format(CSI ++ "{d}F", .{n}),
             .move_col        => |n| return format(CSI ++ "{d}G", .{n}),
+            .scroll_up       => |n| return format(CSI ++ "{d}S", .{n}),
+            .scroll_down     => |n| return format(CSI ++ "{d}T", .{n}),
             .home            => return CSI ++ "H",
             .clear_up        => return CSI ++ "0J",
             .clear_down      => return CSI ++ "1J",
@@ -906,9 +1031,8 @@ const AnsiCode = union(enum) {
             .clear_right     => return CSI ++ "0K",
             .clear_left      => return CSI ++ "1K",
             .clear_line      => return CSI ++ "2K",
-            .scroll_up       => return ESC ++ " M",
-            .save            => return ESC ++ " 7",
-            .restore         => return ESC ++ " 8",
+            .save            => return CSI ++ "s",
+            .restore         => return CSI ++ "u",
             // zig fmt: on
         }
     }
@@ -916,6 +1040,6 @@ const AnsiCode = union(enum) {
     fn format(comptime fmt: []const u8, args: anytype) []const u8 {
         var buffer: [16]u8 = undefined;
         const res = std.fmt.bufPrint(&buffer, fmt, args) catch unreachable;
-        return g.temp.alloc(res);
+        return g.temp.store(res);
     }
 };
