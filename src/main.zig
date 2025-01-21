@@ -21,9 +21,8 @@ const Aliases = AliasMap(16 * 1024);
 const BumpAlloc = mem.BumpAlloc;
 const BlockAlloc = mem.BlockAlloc;
 
-const g = @import("global.zig").global;
-
 const assert = std.debug.assert;
+const dbg = std.debug.print;
 
 pub const MEMORY_OFFSET = 1 << 33;
 
@@ -43,7 +42,7 @@ pub const Builtins = enum {
 
 pub const Panic = struct {
     pub fn call(msg: []const u8, stack_trace: ?*std.builtin.StackTrace, ret_addr: ?usize) noreturn {
-        g.term.cooked();
+        term.cooked();
         std.debug.defaultPanic(msg, stack_trace, ret_addr);
     }
 
@@ -55,11 +54,18 @@ pub const Panic = struct {
     pub const messages = std.debug.FormattedPanic.messages;
 };
 
+var input: *Input = undefined;
+var output: *Output = undefined;
+var outerr: *Output = undefined;
+
+var term: Term = .{};
+var temp: *TempMem = undefined;
+
 pub fn main() void {
     // Terminal Setup
     //
-    g.term.init();
-    defer g.term.cooked();
+    term.init();
+    defer term.cooked();
 
     // Allocate Memory
     //
@@ -68,7 +74,7 @@ pub fn main() void {
     memblk.reserve(.static, BumpAlloc, 1);
     memblk.reserve(.static, CommandBuffer, 1);
     memblk.reserve(.static, Input, 1);
-    memblk.reserve(.static, Output, 1);
+    memblk.reserve(.static, Output, 2);
     memblk.reserve(.static, TempMem, 1);
     memblk.reserve(.arena, u8, 1 << 20);
     memblk.commit();
@@ -80,9 +86,10 @@ pub fn main() void {
     const aliases = static_blk.create(Aliases);
     const arena = static_blk.create(BumpAlloc);
     const combuf = static_blk.create(CommandBuffer);
-    const input = static_blk.create(Input);
-    const output = static_blk.create(Output);
-    g.temp = static_blk.create(TempMem);
+    input = static_blk.create(Input);
+    output = static_blk.create(Output);
+    outerr = static_blk.create(Output);
+    temp = static_blk.create(TempMem);
     aliases.init();
     arena.* = memblk.arena(.arena);
 
@@ -157,7 +164,7 @@ pub fn main() void {
                 output.write(" 👻 ");
                 state = .ReadingInput;
                 combuf.reset();
-                g.term.sashimi();
+                term.sashimi();
             },
             .ReadingInput => {
                 if (input.read_byte()) |byte| {
@@ -180,27 +187,35 @@ pub fn main() void {
                         asc.HORIZ_TAB => {
                             // :Completions
                             //
-                            var tmp_cmd: Command = .{};
+                            var last_arg: []const u8 = undefined;
 
                             var args_iter = combuf.iterator();
                             while (args_iter.next()) |arg| {
-                                if (tmp_cmd.argc < 32) {
-                                    tmp_cmd.argv[tmp_cmd.argc] = arg;
-                                    tmp_cmd.argc += 1;
-                                } else {
-                                    @panic("No application needs more than 32 args! Right!?!?");
-                                }
+                                last_arg = arg;
+                            }
+
+                            if (last_arg.len == 0) {
+                                continue :run;
                             }
 
                             {
                                 output.write(AnsiCode.code(.save));
 
-                                const prefix = tmp_cmd.argv[tmp_cmd.argc - 1];
+                                const slash_pos: ?usize = std.mem.lastIndexOfScalar(u8, last_arg, '/');
+
+                                var search_dir = cwd.dir;
+                                var prefix = last_arg;
+                                if (slash_pos) |pos| {
+                                    search_dir = cwd.dir.openDir(last_arg[0..pos], .{ .iterate = true }) catch unreachable;
+                                    prefix = last_arg[pos + 1 ..];
+                                }
+
                                 var completions: usize = 0;
                                 var extend_buf: [256]u8 = undefined;
                                 var extend: []u8 = extend_buf[0..256];
                                 var first = true;
-                                var dir_iter = cwd.iterator();
+                                var dir_iter = search_dir.iterate();
+
                                 output.write(AnsiCode.code(.{ .move_down = 1 }));
                                 output.write("\r");
                                 output.write(AnsiCode.code(.clear_line));
@@ -215,11 +230,8 @@ pub fn main() void {
                                                 extend = extend_buf[0..ending.len];
                                             } else {
                                                 const end = @min(extend.len, ending.len);
-                                                // std.debug.print("Extend len: {d} / Ending len: {d}\r\n", .{ extend.len, ending.len });
-                                                // std.debug.print("End: {d}\n", .{end});
                                                 for (0..end) |idx| {
                                                     if (extend[idx] != ending[idx]) {
-                                                        // std.debug.print("idx: {d}\r\n", .{idx});
                                                         extend = extend[0..idx];
                                                         break;
                                                     }
@@ -243,10 +255,17 @@ pub fn main() void {
                                     output.write(extend);
 
                                     if (completions == 1) {
-                                        // TODO: If the completion is a directory, append a slash
-                                        // instead of a space, and then seraching in the subdirectory
-                                        combuf.insert(combuf.head, " ");
-                                        output.write_byte(' ');
+                                        var path = temp.alloc(prefix.len + extend.len);
+                                        stx.memcpy(path, prefix);
+                                        stx.memcpy(path[prefix.len..], extend);
+                                        const path_dir = cwd.dir.openDir(path, .{ .iterate = true }) catch null;
+                                        if (path_dir) |_| {
+                                            combuf.insert(combuf.head, "/");
+                                            output.write_byte('/');
+                                        } else {
+                                            combuf.insert(combuf.head, " ");
+                                            output.write_byte(' ');
+                                        }
                                     }
                                 }
                             }
@@ -311,7 +330,7 @@ pub fn main() void {
                 assert(combuf.head > 0);
 
                 var args_iter = combuf.iterator();
-                // Alias Expansion
+                // :ExpandAlias
                 //
                 while (true) {
                     if (args_iter.peek()) |arg| {
@@ -332,10 +351,12 @@ pub fn main() void {
                     continue :run;
                 }
 
+                // :SearchPath
+                //
                 var slash_pos: usize = 0;
                 while (slash_pos < try_cmd.len) : (slash_pos += 1) {
                     if (try_cmd[slash_pos] == '/') {
-                        std.debug.print("Found path command", .{});
+                        outerr.writeln("Found path command");
                         break;
                     }
                 } else {
@@ -382,7 +403,6 @@ pub fn main() void {
 
                 command = .{ .argc = 0, .argv = undefined };
 
-                // args_iter.reset();
                 while (args_iter.next()) |arg| {
                     if (command.argc < 32) {
                         command.argv[command.argc] = arg;
@@ -395,7 +415,7 @@ pub fn main() void {
                 state = .ExecutingCommand;
             },
             .ExecutingBuiltin => {
-                g.term.cooked();
+                term.cooked();
                 defer state = .Prompting;
 
                 switch (command.builtin.?) {
@@ -407,7 +427,7 @@ pub fn main() void {
                         if (command.argc > 1) {
                             const reldir = command.argv[1];
                             cwd.chdir(reldir) catch |err| {
-                                std.debug.print("Failed to open dir: {!}\n", .{err});
+                                outerr.println("Failed to open dir: {!}", .{err});
                                 continue :run;
                             };
                         }
@@ -416,7 +436,7 @@ pub fn main() void {
                 state = .Prompting;
             },
             .ExecutingCommand => {
-                g.term.cooked();
+                term.cooked();
                 defer state = .Prompting;
 
                 // TODO: Rewrite this doing the fork/execve ourselves
@@ -431,6 +451,13 @@ pub fn main() void {
                     output.write(arg);
                 }
                 output.write_byte(asc.LINE_FEED);
+
+                if (false) {
+                    for (command.argv[0..command.argc], 0..) |arg, i| {
+                        dbg("\r\nArg {d}: {s}", .{ i, arg });
+                    }
+                    dbg("\r\n", .{});
+                }
 
                 var child = std.process.Child.init(command.argv[0..command.argc], allocator);
                 child.stdin_behavior = .Inherit;
@@ -584,7 +611,7 @@ const CommandBuffer = struct {
     }
 
     pub fn debug(self: *CommandBuffer) void {
-        std.debug.print("Buffer: {s}\n", .{self.buffer[0..self.head]});
+        dbg("Buffer: {s}\n", .{self.buffer[0..self.head]});
     }
 
     pub const Iterator = struct {
@@ -597,7 +624,7 @@ const CommandBuffer = struct {
 
         pub fn next(self: *Iterator) ?[]const u8 {
             if (self.peek()) |arg| {
-                while (self.buffer[self.cursor] == ' ') : (self.cursor += 1) {}
+                self.cursor = self.skip_spaces(self.cursor);
                 self.cursor += arg.len;
                 return arg;
             } else {
@@ -619,11 +646,11 @@ const CommandBuffer = struct {
             var state: Iterator.State = .Unescaped;
 
             var begin = self.cursor;
+            begin = self.skip_spaces(begin);
+
             if (self.buffer.len == begin) {
                 return null;
             }
-
-            while (self.buffer[begin] == ' ') : (begin += 1) {}
 
             // TODO: Handle backslash escapes
             const end: usize = blk: for (
@@ -665,6 +692,14 @@ const CommandBuffer = struct {
 
             return self.buffer[begin..end];
         }
+
+        fn skip_spaces(self: *Iterator, offset: usize) usize {
+            var result = offset;
+            while (self.buffer.len > result and self.buffer[result] == ' ') {
+                result += 1;
+            }
+            return result;
+        }
     };
 };
 
@@ -685,7 +720,7 @@ const Input = struct {
                 return buf[0];
             }
         } else |err| {
-            std.debug.print("stdin: {any}\n", .{err});
+            outerr.println("stdin: {any}", .{err});
         }
 
         return null;
@@ -693,7 +728,6 @@ const Input = struct {
 };
 
 const Output = struct {
-    vecs: [16]psx.iovec_const = undefined,
     head: u8 = 0,
     len: usize = 0,
 
@@ -703,14 +737,21 @@ const Output = struct {
         assert(count == 1);
     }
 
-    pub fn write(self: *Output, buffer: []const u8) void {
+    pub fn write(self: *Output, bytes: []const u8) void {
         _ = self;
-        const count = psx.write(psx.STDOUT_FILENO, buffer) catch unreachable;
-        assert(count == buffer.len);
+        const count = psx.write(psx.STDOUT_FILENO, bytes) catch unreachable;
+        assert(count == bytes.len);
     }
 
     pub fn writeln(self: *Output, buffer: []const u8) void {
         self.write(buffer);
+        self.write("\r\n");
+    }
+
+    pub fn println(self: *Output, comptime fmt: []const u8, args: anytype) void {
+        const buffer = temp.alloc(1024);
+        const res = std.fmt.bufPrint(buffer, fmt, args) catch unreachable;
+        self.write(res);
         self.write("\r\n");
     }
 };
@@ -959,6 +1000,41 @@ test "RingBuffer concurrent access" {
     }
 }
 
+const Term = struct {
+    welldone: psx.termios = undefined,
+    rare: psx.termios = undefined,
+
+    pub fn init(self: *Term) void {
+        self.welldone = psx.tcgetattr(std.posix.STDIN_FILENO) catch unreachable;
+        self.rare = self.welldone;
+
+        self.rare.iflag.BRKINT = false;
+        self.rare.iflag.ICRNL = false;
+        self.rare.iflag.INPCK = false;
+        self.rare.iflag.ISTRIP = false;
+        self.rare.iflag.IXON = false;
+
+        self.rare.lflag.ICANON = false;
+        self.rare.lflag.ECHO = false;
+        self.rare.lflag.ISIG = false;
+        self.rare.lflag.IEXTEN = false;
+
+        self.rare.oflag.OPOST = false;
+
+        self.rare.cflag.CSIZE = psx.CSIZE.CS8;
+        self.rare.cc[@intFromEnum(std.c.V.MIN)] = 1;
+        self.rare.cc[@intFromEnum(std.c.V.TIME)] = 0;
+    }
+
+    pub fn cooked(self: *Term) void {
+        psx.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.welldone) catch unreachable;
+    }
+
+    pub fn sashimi(self: *Term) void {
+        psx.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.rare) catch unreachable;
+    }
+};
+
 // zig fmt: off
 // ASCII Codes
 //
@@ -1040,6 +1116,6 @@ const AnsiCode = union(enum) {
     fn format(comptime fmt: []const u8, args: anytype) []const u8 {
         var buffer: [16]u8 = undefined;
         const res = std.fmt.bufPrint(&buffer, fmt, args) catch unreachable;
-        return g.temp.store(res);
+        return temp.store(res);
     }
 };
