@@ -5,26 +5,45 @@ const fs = std.fs;
 const meta = std.meta;
 const psx = std.posix;
 
+const BumpAlloc = mem.BumpAlloc;
+const BlockAlloc = mem.BlockAlloc;
+
 const AtomSize = std.atomic.Value(usize);
+const Blocks = BlockAlloc(MemoryBlocks);
+const TempMem = RingAllocator(16 * 1024);
+const Aliases = AliasMap(16 * 1024);
+const History = HistoryList(1 * MB);
+
+const assert = std.debug.assert;
+
+fn dbg(comptime fmt: []const u8, args: anytype) void {
+    comptime {
+        const new_fmt_len = std.mem.replacementSize(u8, fmt, "\n", "\r\n");
+        if (new_fmt_len > fmt.len) {
+            var new_fmt: [new_fmt_len]u8 = undefined;
+            _ = std.mem.replace(u8, fmt, "\n", "\r\n", new_fmt[0..]);
+        }
+    }
+
+    const buffer = temp.alloc(1024);
+    const res = std.fmt.bufPrint(buffer, fmt, args) catch unreachable;
+    std.debug.lockStdErr();
+    defer std.debug.unlockStdErr();
+    const stderr = std.io.getStdErr();
+    stderr.writeAll(res) catch return;
+}
+
+const KB = 1024;
+const MB = 1024 * KB;
+const GB = 1024 * MB;
+
+const MEMORY_OFFSET = 1 << 33;
 
 const MemoryBlocks = enum {
     static,
     buffers,
     arena,
 };
-
-pub const Blocks = BlockAlloc(MemoryBlocks);
-
-pub const TempMem = RingAllocator(16 * 1024);
-
-const Aliases = AliasMap(16 * 1024);
-const BumpAlloc = mem.BumpAlloc;
-const BlockAlloc = mem.BlockAlloc;
-
-const assert = std.debug.assert;
-const dbg = std.debug.print;
-
-pub const MEMORY_OFFSET = 1 << 33;
 
 const PromptState = enum {
     Prompting,
@@ -34,7 +53,7 @@ const PromptState = enum {
     ExecutingCommand,
 };
 
-pub const Builtins = enum {
+const Builtins = enum {
     exit,
     pwd,
     cd,
@@ -71,12 +90,13 @@ pub fn main() void {
     //
     var memblk = Blocks{ .offset = MEMORY_OFFSET };
     memblk.reserve(.static, Aliases, 1);
+    memblk.reserve(.static, History, 1);
     memblk.reserve(.static, BumpAlloc, 1);
     memblk.reserve(.static, CommandBuffer, 1);
     memblk.reserve(.static, Input, 1);
     memblk.reserve(.static, Output, 2);
     memblk.reserve(.static, TempMem, 1);
-    memblk.reserve(.arena, u8, 1 << 20);
+    memblk.reserve(.arena, u8, 1 * MB);
     memblk.commit();
     defer memblk.release();
 
@@ -84,6 +104,7 @@ pub fn main() void {
     //
     var static_blk = memblk.block(.static);
     const aliases = static_blk.create(Aliases);
+    const history = static_blk.create(History);
     const arena = static_blk.create(BumpAlloc);
     const combuf = static_blk.create(CommandBuffer);
     input = static_blk.create(Input);
@@ -276,17 +297,33 @@ pub fn main() void {
                                 const esc_byte = input.read_byte() orelse 0;
 
                                 switch (esc_byte) {
-                                    'A' => {
-                                        // Key up
+                                    'A' => { // Key Up
+                                        if (history.prev_line()) |line| {
+                                            if (combuf.command_slice().len > 0) {
+                                                const comlen: u8 = @intCast(combuf.command_slice().len);
+                                                output.write(AnsiCode.code(.{ .move_left = comlen }));
+                                            }
+                                            output.write(AnsiCode.code(.clear_right));
+                                            output.write(line);
+                                            combuf.reset();
+                                            combuf.insert(0, line);
+                                        }
                                     },
-                                    'B' => {
-                                        // Key down
+                                    'B' => { // Key Down
+                                        if (history.next_line()) |line| {
+                                            if (combuf.command_slice().len > 0) {
+                                                const comlen: u8 = @intCast(combuf.command_slice().len);
+                                                output.write(AnsiCode.code(.{ .move_left = comlen }));
+                                            }
+                                            output.write(AnsiCode.code(.clear_right));
+                                            output.write(line);
+                                            combuf.reset();
+                                            combuf.insert(0, line);
+                                        }
                                     },
-                                    'C' => {
-                                        // Key right
+                                    'C' => { // Key right
                                     },
-                                    'D' => {
-                                        // Key left
+                                    'D' => { // Key left
                                     },
                                     else => {
                                         output.writeln("Unknown Escape Key");
@@ -329,14 +366,17 @@ pub fn main() void {
 
                 assert(combuf.head > 0);
 
-                var args_iter = combuf.iterator();
+                var runbuf = CommandBuffer{};
+                combuf.copy(&runbuf);
+                var args_iter = runbuf.iterator();
+
                 // :ExpandAlias
                 //
                 while (true) {
                     if (args_iter.peek()) |arg| {
                         if (aliases.find(arg)) |replacement| {
                             const replacing_self = std.mem.startsWith(u8, replacement, arg);
-                            combuf.replace(arg, replacement);
+                            runbuf.replace(arg, replacement);
                             if (!replacing_self) continue;
                         }
                     }
@@ -391,7 +431,7 @@ pub fn main() void {
                             var new_argv: [psx.PATH_MAX]u8 = undefined;
                             stx.memcpy(new_argv[0..], path_str);
                             new_argv[path_str.len] = '/';
-                            combuf.insert(0, new_argv[0..(path_str.len + 1)]);
+                            runbuf.insert(0, new_argv[0..(path_str.len + 1)]);
                             break :path;
                         }
                     } else {
@@ -468,7 +508,9 @@ pub fn main() void {
                 const child_term = child.wait() catch unreachable;
 
                 switch (child_term) {
-                    .Exited => {},
+                    .Exited => {
+                        history.insert(combuf.command_slice());
+                    },
                     .Signal => {
                         output.write("Signaled\n");
                     },
@@ -550,6 +592,12 @@ const CommandBuffer = struct {
     pub fn init(self: *CommandBuffer) void {
         self.head = 0;
         @memset(self.buffer[0..SIZE], 0);
+    }
+
+    pub fn copy(self: *CommandBuffer, to: *CommandBuffer) void {
+        stx.memcpy(to.buffer[0..], self.buffer[0..self.head]);
+        to.head = self.head;
+        to.version = 0;
     }
 
     pub fn reset(self: *CommandBuffer) void {
@@ -703,6 +751,87 @@ const CommandBuffer = struct {
     };
 };
 
+// :HistoryList
+pub fn HistoryList(comptime cap: usize) type {
+    stx.assert_log2(cap);
+    assert(cap > 16 * 1024);
+
+    // The format of this buffer is laid ou in the following way:
+    // [len][str][len]
+    // This makes it a kind of intrusive doubly linked list using
+    // 8 bit offsets as pointers to the next fat string.
+    //
+    // The len is strictly the str length and does not account for the
+    // 2 len bytes themselves.
+    //
+    // The cursor is virtual, like rings head/tail, and is pinened to
+    // head on each insert.
+    const RB = RingBuffer(cap, false);
+
+    return struct {
+        ring: RB = undefined,
+        cursor: usize = 0,
+
+        const Self = @This();
+        const MAX_LINE = 256;
+
+        pub fn init(self: *Self) void {
+            self.ring.init("History");
+        }
+
+        pub fn insert(self: *Self, line: []const u8) void {
+            const count = line.len + 2;
+            const line_len: u8 = @intCast(line.len);
+
+            assert(count <= MAX_LINE);
+
+            var writable = self.ring.writable_slice().len;
+
+            if (count > writable) {
+                self.ring.commit(writable);
+            }
+
+            writable = self.ring.writable_slice().len;
+
+            if (count > writable) {
+                self.ring.release(self.ring.buffer[self.ring.tail.raw] + 2);
+            }
+
+            const slice = self.ring.writable_slice()[0..count];
+
+            slice[0] = line_len;
+            stx.memcpy(slice[1..], line);
+            slice[line_len + 1] = line_len;
+            self.ring.commit(line_len + 2);
+            self.cursor = self.ring.head.raw;
+        }
+
+        pub fn prev_line(self: *Self) ?[]const u8 {
+            if (self.cursor == self.ring.tail.raw) {
+                return null;
+            }
+
+            const p_cursor = (self.cursor - 1) & RB.MASK;
+            const line_len = self.ring.buffer[p_cursor];
+            const line = self.ring.buffer[p_cursor - line_len .. p_cursor];
+            self.cursor -= line_len + 2;
+            return line;
+        }
+
+        pub fn next_line(self: *Self) ?[]const u8 {
+            if (self.cursor == self.ring.head.raw) {
+                return null;
+            }
+
+            const p_cursor = self.cursor & RB.MASK;
+            const line_len = self.ring.buffer[p_cursor];
+            const line = self.ring.buffer[p_cursor + 1 .. p_cursor + line_len + 1];
+            self.cursor += line_len + 2;
+            return line;
+        }
+    };
+}
+
 const Input = struct {
     fds: [1]psx.pollfd = undefined,
 
@@ -815,7 +944,7 @@ pub fn RingBuffer(comptime size: u32, comptime thread_safe: bool) type {
 
         const Self = @This();
         pub const SIZE = size;
-        const MASK = size - 1;
+        pub const MASK = size - 1;
 
         pub fn init(self: *Self, name: []const u8) void {
             self.name = name;
