@@ -823,11 +823,21 @@ pub fn HistoryList(comptime cap: usize) type {
                 return null;
             }
 
-            const p_cursor = self.cursor & RB.MASK;
-            const line_len = self.ring.buffer[p_cursor];
-            const line = self.ring.buffer[p_cursor + 1 .. p_cursor + line_len + 1];
-            self.cursor += line_len + 2;
-            return line;
+            {
+                const p_cursor = self.cursor & RB.MASK;
+                const line_len = self.ring.buffer[p_cursor];
+                self.cursor += line_len + 2;
+                if (self.cursor == self.ring.head.raw) {
+                    return null;
+                }
+            }
+
+            {
+                const p_cursor = self.cursor & RB.MASK;
+                const line_len = self.ring.buffer[p_cursor];
+                const line = self.ring.buffer[p_cursor + 1 .. p_cursor + line_len + 1];
+                return line;
+            }
         }
     };
 }
