@@ -37,6 +37,12 @@ pub fn assert_zeroes(buf: []const u8) void {
     assert(success);
 }
 
+pub fn index(bytes: []const u8, byte: u8) ?usize {
+    var ret: usize = 0;
+    while (ret < bytes.len and bytes[ret] != byte) ret += 1;
+    return if (ret == bytes.len) null else ret;
+}
+
 pub fn memcpy(target: []u8, source: []const u8) void {
     assert(target.len >= source.len);
     assert(target.ptr != source.ptr);

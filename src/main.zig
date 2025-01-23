@@ -10,8 +10,8 @@ const BlockAlloc = mem.BlockAlloc;
 
 const AtomSize = std.atomic.Value(usize);
 const Blocks = BlockAlloc(MemoryBlocks);
-const TempMem = RingAllocator(16 * 1024);
-const Aliases = AliasMap(16 * 1024);
+const TempMem = RingAllocator(1 * MB);
+const Aliases = AliasMap(1 * MB);
 const History = HistoryList(1 * MB);
 
 const assert = std.debug.assert;
@@ -25,12 +25,28 @@ fn dbg(comptime fmt: []const u8, args: anytype) void {
         }
     }
 
-    const buffer = temp.alloc(1024);
-    const res = std.fmt.bufPrint(buffer, fmt, args) catch unreachable;
-    std.debug.lockStdErr();
-    defer std.debug.unlockStdErr();
-    const stderr = std.io.getStdErr();
-    stderr.writeAll(res) catch return;
+    var buf = RingBuffer(1024, false){ .name = "" };
+    const res = std.fmt.bufPrint(buf.writable_slice(), fmt, args) catch unreachable;
+    output.write("\x1b[s\x1b[1;1H\x1b[2K");
+    output.write(res);
+    output.write("\x1b[u");
+}
+
+fn dbg_prompt(prompt: *CommandPrompt) void {
+    var buf = RingBuffer(1024, false){ .name = "" };
+    var tmp: [64]u8 = undefined;
+
+    buf.write_all(AnsiCode.code(.save));
+    buf.write_all("\x1b[2;1H\x1b[0K Prompt: ");
+    buf.write_all(prompt.command_slice());
+    buf.write_all("\x1b[3;1H\x1b[0K Head: ");
+    const head_len = std.fmt.formatIntBuf(&tmp, prompt.head, 10, .lower, .{});
+    buf.write_all(tmp[0..head_len]);
+    buf.write_all("\x1b[4;1H\x1b[0K ---------------------------------------------");
+    buf.write_all(AnsiCode.code(.restore));
+
+    output.write(buf.readable_slice());
+    buf.reset();
 }
 
 const KB = 1024;
@@ -41,8 +57,6 @@ const MEMORY_OFFSET = 1 << 33;
 
 const MemoryBlocks = enum {
     static,
-    buffers,
-    arena,
 };
 
 const PromptState = enum {
@@ -60,7 +74,11 @@ const Builtins = enum {
 };
 
 pub const Panic = struct {
-    pub fn call(msg: []const u8, stack_trace: ?*std.builtin.StackTrace, ret_addr: ?usize) noreturn {
+    pub fn call(
+        msg: []const u8,
+        stack_trace: ?*std.builtin.StackTrace,
+        ret_addr: ?usize,
+    ) noreturn {
         term.cooked();
         std.debug.defaultPanic(msg, stack_trace, ret_addr);
     }
@@ -92,11 +110,10 @@ pub fn main() void {
     memblk.reserve(.static, Aliases, 1);
     memblk.reserve(.static, History, 1);
     memblk.reserve(.static, BumpAlloc, 1);
-    memblk.reserve(.static, CommandBuffer, 1);
+    memblk.reserve(.static, CommandPrompts, 1);
     memblk.reserve(.static, Input, 1);
     memblk.reserve(.static, Output, 2);
     memblk.reserve(.static, TempMem, 1);
-    memblk.reserve(.arena, u8, 1 * MB);
     memblk.commit();
     defer memblk.release();
 
@@ -105,14 +122,12 @@ pub fn main() void {
     var static_blk = memblk.block(.static);
     const aliases = static_blk.create(Aliases);
     const history = static_blk.create(History);
-    const arena = static_blk.create(BumpAlloc);
-    const combuf = static_blk.create(CommandBuffer);
+    const prompts = static_blk.create(CommandPrompts);
     input = static_blk.create(Input);
     output = static_blk.create(Output);
     outerr = static_blk.create(Output);
     temp = static_blk.create(TempMem);
-    aliases.init();
-    arena.* = memblk.arena(.arena);
+    // aliases.init();
 
     // Current Path
     var cwd = struct {
@@ -175,19 +190,24 @@ pub fn main() void {
     var state: PromptState = .Prompting;
     var running = true;
     var command: Command = .{};
+    var prompt: *CommandPrompt = prompts.insert("");
+
+    term.sashimi();
+    output.write("\x1b[H\x1b[2J\x1b[5;1H");
 
     run: while (running) {
-        defer arena.reset();
+        std.Thread.sleep(std.time.ns_per_ms * 1);
 
         switch (state) {
             .Prompting => {
                 output.write(fs.path.basename(cwd.path()));
                 output.write(" 👻 ");
                 state = .ReadingInput;
-                combuf.reset();
+                prompts.reset();
                 term.sashimi();
             },
             .ReadingInput => {
+                dbg_prompt(prompt);
                 if (input.read_byte()) |byte| {
                     switch (byte) {
                         asc.CTRL_C => {
@@ -195,61 +215,69 @@ pub fn main() void {
                             running = false;
                         },
                         asc.LINE_FEED, asc.CAR_RETURN => {
-                            state = if (combuf.head == 0) .Prompting else .Parsing;
-                            output.writeln(" ");
+                            state = if (prompt.head == 0) .Prompting else .Parsing;
+                            output.write("\r\n");
                         },
                         asc.BACKSPACE, asc.DELETE => {
-                            if (combuf.head > 0) {
+                            if (prompt.head > 0) {
                                 output.write_byte(asc.BACKSPACE);
                                 output.write(AnsiCode.code(.clear_right));
-                                combuf.drop(1);
+                                prompt.drop(1);
                             }
                         },
                         asc.HORIZ_TAB => {
                             // :Completions
                             //
-                            var last_arg: []const u8 = undefined;
+                            dbg("", .{});
+                            var args_iter = prompt.iterator();
 
-                            var args_iter = combuf.iterator();
+                            command = .{ .argc = 0, .argv = undefined };
+
                             while (args_iter.next()) |arg| {
-                                last_arg = arg;
+                                if (command.argc < 32) {
+                                    command.argv[command.argc] = arg;
+                                    command.argc += 1;
+                                } else {
+                                    @panic("No application needs more than 32 args! Right!?!?");
+                                }
                             }
 
-                            if (last_arg.len == 0) {
+                            if (command.argc < 2) {
+                                // TODO: Support command completion
                                 continue :run;
-                            }
+                            } else {
+                                // Path Completion
+                                output.write("\x1b[s");
+                                const arg = command.argv[command.argc - 1];
 
-                            {
-                                output.write(AnsiCode.code(.save));
-
-                                const slash_pos: ?usize = std.mem.lastIndexOfScalar(u8, last_arg, '/');
+                                const slash_pos = stx.index(arg, '/');
 
                                 var search_dir = cwd.dir;
-                                var prefix = last_arg;
+                                var prefix = arg;
                                 if (slash_pos) |pos| {
-                                    search_dir = cwd.dir.openDir(last_arg[0..pos], .{ .iterate = true }) catch unreachable;
-                                    prefix = last_arg[pos + 1 ..];
+                                    search_dir = cwd.dir.openDir(arg[0..pos], .{ .iterate = true }) catch unreachable;
+                                    prefix = arg[pos + 1 ..];
                                 }
 
                                 var completions: usize = 0;
                                 var extend_buf: [256]u8 = undefined;
                                 var extend: []u8 = extend_buf[0..256];
-                                var first = true;
+                                var found = false;
                                 var dir_iter = search_dir.iterate();
 
-                                output.write(AnsiCode.code(.{ .move_down = 1 }));
-                                output.write("\r");
-                                output.write(AnsiCode.code(.clear_line));
+                                output.write("\r\n\x1b[0J");
+                                // TODO: This needs to be buffered for two reasons
+                                // 1) To provide proper handling when the prompt is
+                                //    at the bottom of the screen. Our cursor position
+                                //    needs to change and not simply be restored as there
+                                //    is a scroll up by an unknown number of lines.
+                                // 2) We want the results sorted.
                                 while (dir_iter.next() catch null) |entry| {
                                     if (std.mem.startsWith(u8, entry.name, prefix)) {
                                         const completion = std.fs.path.basename(entry.name);
                                         if (extend.len > 0) {
                                             const ending = completion[prefix.len..];
-                                            if (first) {
-                                                first = false;
-                                                stx.memcpy(extend_buf[0..], ending);
-                                                extend = extend_buf[0..ending.len];
-                                            } else {
+                                            if (found) {
                                                 const end = @min(extend.len, ending.len);
                                                 for (0..end) |idx| {
                                                     if (extend[idx] != ending[idx]) {
@@ -257,22 +285,25 @@ pub fn main() void {
                                                         break;
                                                     }
                                                 }
+                                            } else {
+                                                found = true;
+                                                stx.memcpy(extend_buf[0..], ending);
+                                                extend = extend_buf[0..ending.len];
                                             }
                                         }
                                         completions += 1;
                                         output.write(completion);
-                                        output.write_byte(asc.HORIZ_TAB);
+                                        output.write("\t");
                                     }
                                 }
 
                                 if (completions == 1) {
-                                    output.write("\r");
-                                    output.write(AnsiCode.code(.clear_line));
+                                    output.write("\r\x1b[2K");
                                 }
 
-                                output.write(AnsiCode.code(.restore));
-                                if (extend.len > 0) {
-                                    combuf.insert(combuf.head, extend);
+                                output.write("\x1b[u");
+                                if (completions > 0 and extend.len > 0) {
+                                    prompt.insert(prompt.head, extend);
                                     output.write(extend);
 
                                     if (completions == 1) {
@@ -281,10 +312,10 @@ pub fn main() void {
                                         stx.memcpy(path[prefix.len..], extend);
                                         const path_dir = cwd.dir.openDir(path, .{ .iterate = true }) catch null;
                                         if (path_dir) |_| {
-                                            combuf.insert(combuf.head, "/");
+                                            prompt.insert(prompt.head, "/");
                                             output.write_byte('/');
                                         } else {
-                                            combuf.insert(combuf.head, " ");
+                                            prompt.insert(prompt.head, " ");
                                             output.write_byte(' ');
                                         }
                                     }
@@ -299,26 +330,34 @@ pub fn main() void {
                                 switch (esc_byte) {
                                     'A' => { // Key Up
                                         if (history.prev_line()) |line| {
-                                            if (combuf.command_slice().len > 0) {
-                                                const comlen: u8 = @intCast(combuf.command_slice().len);
+                                            if (prompt.command_slice().len > 0) {
+                                                const comlen: u8 = @intCast(prompt.command_slice().len);
                                                 output.write(AnsiCode.code(.{ .move_left = comlen }));
+                                                output.write(AnsiCode.code(.clear_right));
                                             }
-                                            output.write(AnsiCode.code(.clear_right));
                                             output.write(line);
-                                            combuf.reset();
-                                            combuf.insert(0, line);
+
+                                            if (prompts.prev()) |buf| {
+                                                prompt = buf;
+                                            } else {
+                                                prompt = prompts.insert(line);
+                                            }
                                         }
                                     },
                                     'B' => { // Key Down
                                         if (history.next_line()) |line| {
-                                            if (combuf.command_slice().len > 0) {
-                                                const comlen: u8 = @intCast(combuf.command_slice().len);
+                                            if (prompt.command_slice().len > 0) {
+                                                const comlen: u8 = @intCast(prompt.command_slice().len);
                                                 output.write(AnsiCode.code(.{ .move_left = comlen }));
+                                                output.write(AnsiCode.code(.clear_right));
                                             }
-                                            output.write(AnsiCode.code(.clear_right));
                                             output.write(line);
-                                            combuf.reset();
-                                            combuf.insert(0, line);
+
+                                            if (prompts.next()) |buf| {
+                                                prompt = buf;
+                                            } else {
+                                                prompt = prompts.insert(line);
+                                            }
                                         }
                                     },
                                     'C' => { // Key right
@@ -339,7 +378,7 @@ pub fn main() void {
                             @branchHint(.likely);
                             // TODO: Completion Hint
                             output.write_byte(byte);
-                            combuf.push(byte);
+                            prompt.push(byte);
                         },
                     }
                 }
@@ -364,10 +403,10 @@ pub fn main() void {
                 // unset - delete a function
                 // hash -d <name> delete a hash table entry
 
-                assert(combuf.head > 0);
+                assert(prompt.head > 0);
 
-                var runbuf = CommandBuffer{};
-                combuf.copy(&runbuf);
+                var runbuf = CommandPrompt{};
+                prompt.copy(&runbuf);
                 var args_iter = runbuf.iterator();
 
                 // :ExpandAlias
@@ -384,6 +423,7 @@ pub fn main() void {
                 }
 
                 const try_cmd = args_iter.peek().?;
+                dbg("Try Command: `{s}`", .{try_cmd});
 
                 if (meta.stringToEnum(Builtins, try_cmd)) |builtin| {
                     command.builtin = builtin;
@@ -509,7 +549,9 @@ pub fn main() void {
 
                 switch (child_term) {
                     .Exited => {
-                        history.insert(combuf.command_slice());
+                        history.insert(prompt.command_slice());
+                        prompts.reset();
+                        prompt = prompts.insert("");
                     },
                     .Signal => {
                         output.write("Signaled\n");
@@ -582,40 +624,86 @@ const Command = struct {
     builtin: ?Builtins = null,
 };
 
-const CommandBuffer = struct {
+// :CommandPrompt | :Prompt
+//
+const CommandPrompts = struct {
+    buffers: [64]CommandPrompt = undefined,
+    head: usize = 0,
+    cursor: usize = 0,
+
+    pub fn reset(self: *CommandPrompts) void {
+        self.head = 0;
+        self.cursor = 0;
+    }
+
+    pub fn insert(self: *CommandPrompts, bytes: []const u8) *CommandPrompt {
+        self.buffers[self.head] = CommandPrompt{};
+        if (bytes.len > 0) {
+            self.buffers[self.head].insert(0, bytes);
+        }
+        self.head += 1;
+        self.cursor += 1;
+        return &self.buffers[self.head - 1];
+    }
+
+    pub fn next(self: *CommandPrompts) ?*CommandPrompt {
+        if (self.cursor > 0) {
+            self.cursor -= 1;
+            return &self.buffers[self.cursor];
+        } else {
+            return null;
+        }
+    }
+
+    pub fn prev(self: *CommandPrompts) ?*CommandPrompt {
+        if (self.cursor < self.head) {
+            const result = &self.buffers[self.cursor];
+            self.cursor += 1;
+            return result;
+        } else {
+            return null;
+        }
+    }
+};
+
+const CommandPrompt = struct {
     buffer: [SIZE]u8 = undefined,
     head: usize = 0,
     version: usize = 0,
 
     const SIZE = 4096;
 
-    pub fn init(self: *CommandBuffer) void {
+    pub fn init(self: *CommandPrompt) void {
         self.head = 0;
         @memset(self.buffer[0..SIZE], 0);
     }
 
-    pub fn copy(self: *CommandBuffer, to: *CommandBuffer) void {
+    pub fn copy(self: *CommandPrompt, to: *CommandPrompt) void {
         stx.memcpy(to.buffer[0..], self.buffer[0..self.head]);
         to.head = self.head;
         to.version = 0;
     }
 
-    pub fn reset(self: *CommandBuffer) void {
+    pub fn reset(self: *CommandPrompt) void {
         @memset(self.buffer[0..self.head], 0);
         stx.assert_zeroes(self.buffer[0..SIZE]);
         self.head = 0;
     }
 
-    pub fn command_slice(self: *CommandBuffer) []const u8 {
+    pub fn command_slice(self: *CommandPrompt) []const u8 {
         return self.buffer[0..self.head];
     }
 
-    pub fn push(self: *CommandBuffer, byte: u8) void {
+    pub fn push(self: *CommandPrompt, byte: u8) void {
+        if (byte == ' ' and self.head == 0) {
+            @branchHint(.cold);
+            return;
+        }
         self.buffer[self.head] = byte;
         self.head += 1;
     }
 
-    pub fn drop(self: *CommandBuffer, n: usize) void {
+    pub fn drop(self: *CommandPrompt, n: usize) void {
         if (self.head >= n) {
             self.head -= n;
         } else {
@@ -623,15 +711,15 @@ const CommandBuffer = struct {
         }
     }
 
-    pub fn insert(self: *CommandBuffer, index: usize, source: []const u8) void {
+    pub fn insert(self: *CommandPrompt, index: usize, source: []const u8) void {
         assert(self.buffer.len >= self.head + source.len);
         stx.memcpy(self.buffer[index..][source.len..], self.buffer[index..self.head]);
         stx.memcpy(self.buffer[index..], source);
-        self.head += source.len;
         self.version += 1;
+        self.head += source.len;
     }
 
-    pub fn replace(self: *CommandBuffer, target: []const u8, source: []const u8) void {
+    pub fn replace(self: *CommandPrompt, target: []const u8, source: []const u8) void {
         const begin = @intFromPtr(target.ptr) - @intFromPtr(&self.buffer);
         const target_end = begin + target.len;
         const source_end = begin + source.len;
@@ -649,55 +737,60 @@ const CommandBuffer = struct {
         self.version += 1;
     }
 
-    pub fn iterator(self: *CommandBuffer) Iterator {
+    pub fn iterator(self: *CommandPrompt) Iterator {
         return .{
-            .combuf = self,
+            .prompt = self,
             .cursor = 0,
             .buffer = self.buffer[0..self.head],
             .version = self.version,
         };
     }
 
-    pub fn debug(self: *CommandBuffer) void {
+    pub fn debug(self: *CommandPrompt) void {
         dbg("Buffer: {s}\n", .{self.buffer[0..self.head]});
     }
 
     pub const Iterator = struct {
         const State = enum { Unescaped, EscapedDouble, EscapedSingle };
 
-        combuf: *CommandBuffer,
+        prompt: *CommandPrompt,
         buffer: []const u8,
         cursor: usize = 0,
         version: usize = 0,
+
+        fn refresh(self: *Iterator) void {
+            self.buffer = self.prompt.buffer[0..self.prompt.head];
+            self.version = self.prompt.version;
+            self.cursor = 0;
+        }
 
         pub fn next(self: *Iterator) ?[]const u8 {
             if (self.peek()) |arg| {
                 self.cursor = self.skip_spaces(self.cursor);
                 self.cursor += arg.len;
+
                 return arg;
             } else {
                 return null;
             }
         }
 
-        fn refresh(self: *Iterator) void {
-            self.buffer = self.combuf.buffer[0..self.combuf.head];
-            self.version = self.combuf.version;
-            self.cursor = 0;
-        }
-
         pub fn peek(self: *Iterator) ?[]const u8 {
-            if (self.version != self.combuf.version) {
+            if (self.version != self.prompt.version) {
                 self.refresh();
             }
 
             var state: Iterator.State = .Unescaped;
 
             var begin = self.cursor;
+            if (self.buffer.len == begin) {
+                return null;
+            }
+
             begin = self.skip_spaces(begin);
 
             if (self.buffer.len == begin) {
-                return null;
+                return self.buffer[begin..begin];
             }
 
             // TODO: Handle backslash escapes
@@ -780,6 +873,8 @@ pub fn HistoryList(comptime cap: usize) type {
         }
 
         pub fn insert(self: *Self, line: []const u8) void {
+            assert(line.len < 255);
+
             const count = line.len + 2;
             const line_len: u8 = @intCast(line.len);
 
@@ -882,16 +977,19 @@ const Output = struct {
         assert(count == bytes.len);
     }
 
+    pub fn print(self: *Output, comptime fmt: []const u8, args: anytype) void {
+        var buffer: [1024]u8 = undefined;
+        const res = std.fmt.bufPrint(buffer[0..1024], fmt, args) catch unreachable;
+        self.write(res);
+    }
+
     pub fn writeln(self: *Output, buffer: []const u8) void {
         self.write(buffer);
         self.write("\r\n");
     }
 
     pub fn println(self: *Output, comptime fmt: []const u8, args: anytype) void {
-        const buffer = temp.alloc(1024);
-        const res = std.fmt.bufPrint(buffer, fmt, args) catch unreachable;
-        self.write(res);
-        self.write("\r\n");
+        self.print(fmt ++ "\r\n", args);
     }
 };
 
@@ -930,7 +1028,6 @@ pub fn RingAllocator(comptime cap: usize) type {
             const slice = self.alloc(bytes.len);
 
             @memcpy(slice, bytes);
-            self.buffer.commit(bytes.len);
             return slice[0..bytes.len];
         }
 
@@ -1201,7 +1298,6 @@ const asc = struct {
     const DELETE     = 0x7F;
     const CTRL_C     = END_TEXT;
 };
-
 // zig fmt: on
 
 const AnsiCode = union(enum) {
@@ -1212,6 +1308,7 @@ const AnsiCode = union(enum) {
     move_begin_up: u8,
     move_begin_down: u8,
     move_col: u8,
+    move_to: struct { u8, u8 },
     scroll_up: u8,
     scroll_down: u8,
     home,
@@ -1223,6 +1320,10 @@ const AnsiCode = union(enum) {
     clear_line,
     save,
     restore,
+    dsr_ok,
+    dsr_status,
+    dsr_cursor,
+    mode_origin,
 
     const ESC = "\x1b";
     const CSI = "\x1b[";
@@ -1237,6 +1338,7 @@ const AnsiCode = union(enum) {
             .move_begin_up   => |n| return format(CSI ++ "{d}E", .{n}),
             .move_begin_down => |n| return format(CSI ++ "{d}F", .{n}),
             .move_col        => |n| return format(CSI ++ "{d}G", .{n}),
+            .move_to         => |n| return format(CSI ++ "{d};{d}H", .{n[0], n[1]}),
             .scroll_up       => |n| return format(CSI ++ "{d}S", .{n}),
             .scroll_down     => |n| return format(CSI ++ "{d}T", .{n}),
             .home            => return CSI ++ "H",
@@ -1248,13 +1350,17 @@ const AnsiCode = union(enum) {
             .clear_line      => return CSI ++ "2K",
             .save            => return CSI ++ "s",
             .restore         => return CSI ++ "u",
+            .dsr_ok          => return CSI ++ "0n",
+            .dsr_status      => return CSI ++ "5n",
+            .dsr_cursor      => return CSI ++ "6n",
+            .mode_origin     => return CSI ++ "?6h",
             // zig fmt: on
         }
     }
 
     fn format(comptime fmt: []const u8, args: anytype) []const u8 {
-        var buffer: [16]u8 = undefined;
+        var buffer: [32]u8 = undefined;
         const res = std.fmt.bufPrint(&buffer, fmt, args) catch unreachable;
-        return temp.store(res);
+        return res;
     }
 };
