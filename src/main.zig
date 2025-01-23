@@ -2,7 +2,6 @@ const std = @import("std");
 const stx = @import("stx.zig");
 const mem = @import("memory.zig");
 const fs = std.fs;
-const meta = std.meta;
 const psx = std.posix;
 
 const BumpAlloc = mem.BumpAlloc;
@@ -71,6 +70,18 @@ const Builtins = enum {
     exit,
     pwd,
     cd,
+
+    const EXIT = "exit";
+    const PWD = "pwd";
+    const CD = "cd";
+
+    pub fn from_str(cmd: []const u8) ?Builtins {
+        if (stx.str_eql(cmd, CD)) return .cd;
+        if (stx.str_eql(cmd, PWD)) return .pwd;
+        if (stx.str_eql(cmd, EXIT)) return .exit;
+
+        return null;
+    }
 };
 
 pub const Panic = struct {
@@ -149,10 +160,12 @@ pub fn main() void {
         }
 
         pub fn chdir(self: *@This(), reldir: []const u8) !void {
+            dbg("Chdir: {s}", .{reldir});
             var newdir = try self.dir.openDir(reldir, .{ .iterate = true });
             errdefer newdir.close();
 
             try psx.fchdir(newdir.fd);
+            self.refresh(newdir);
         }
 
         pub fn path(self: *@This()) []const u8 {
@@ -200,6 +213,8 @@ pub fn main() void {
 
         switch (state) {
             .Prompting => {
+                prompts.reset();
+                prompt = prompts.insert("");
                 output.write(fs.path.basename(cwd.path()));
                 output.write(" 👻 ");
                 state = .ReadingInput;
@@ -302,9 +317,11 @@ pub fn main() void {
                                 }
 
                                 output.write("\x1b[u");
-                                if (completions > 0 and extend.len > 0) {
-                                    prompt.insert(prompt.head, extend);
-                                    output.write(extend);
+                                if (completions > 0) {
+                                    if (extend.len > 0) {
+                                        prompt.insert(prompt.head, extend);
+                                        output.write(extend);
+                                    }
 
                                     if (completions == 1) {
                                         var path = temp.alloc(prefix.len + extend.len);
@@ -425,7 +442,17 @@ pub fn main() void {
                 const try_cmd = args_iter.peek().?;
                 dbg("Try Command: `{s}`", .{try_cmd});
 
-                if (meta.stringToEnum(Builtins, try_cmd)) |builtin| {
+                if (Builtins.from_str(try_cmd)) |builtin| {
+                    command = .{ .argc = 0, .argv = undefined };
+
+                    while (args_iter.next()) |arg| if (arg.len > 0) {
+                        if (command.argc < 32) {
+                            command.argv[command.argc] = arg;
+                            command.argc += 1;
+                        } else {
+                            @panic("No application needs more than 32 args! Right!?!?");
+                        }
+                    };
                     command.builtin = builtin;
                     state = .ExecutingBuiltin;
                     continue :run;
@@ -483,14 +510,14 @@ pub fn main() void {
 
                 command = .{ .argc = 0, .argv = undefined };
 
-                while (args_iter.next()) |arg| {
+                while (args_iter.next()) |arg| if (arg.len > 0) {
                     if (command.argc < 32) {
                         command.argv[command.argc] = arg;
                         command.argc += 1;
                     } else {
                         @panic("No application needs more than 32 args! Right!?!?");
                     }
-                }
+                };
 
                 state = .ExecutingCommand;
             },
@@ -504,6 +531,7 @@ pub fn main() void {
                         output.writeln(cwd.path());
                     },
                     .cd => {
+                        dbg("Command: {d} : {any}", .{ command.argc, command.argv[0..command.argc] });
                         if (command.argc > 1) {
                             const reldir = command.argv[1];
                             cwd.chdir(reldir) catch |err| {
@@ -513,7 +541,6 @@ pub fn main() void {
                         }
                     },
                 }
-                state = .Prompting;
             },
             .ExecutingCommand => {
                 term.cooked();
@@ -550,8 +577,6 @@ pub fn main() void {
                 switch (child_term) {
                     .Exited => {
                         history.insert(prompt.command_slice());
-                        prompts.reset();
-                        prompt = prompts.insert("");
                     },
                     .Signal => {
                         output.write("Signaled\n");
@@ -664,6 +689,8 @@ const CommandPrompts = struct {
             return null;
         }
     }
+
+    pub fn debug() void {}
 };
 
 const CommandPrompt = struct {

@@ -37,6 +37,10 @@ pub fn assert_zeroes(buf: []const u8) void {
     assert(success);
 }
 
+pub fn str_eql(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, a, b);
+}
+
 pub fn index(bytes: []const u8, byte: u8) ?usize {
     var ret: usize = 0;
     while (ret < bytes.len and bytes[ret] != byte) ret += 1;
