@@ -71,3 +71,13 @@ pub fn sleep(throttle: *u64) void {
         else => 20,
     };
 }
+
+pub fn strip(bytes: []const u8) []const u8 {
+    var begin: usize = 0;
+    var end: usize = bytes.len;
+
+    while (begin < end and bytes[begin] == ' ') begin += 1;
+    while (end > begin and bytes[end - 1] == ' ') end -= 1;
+
+    return bytes[begin..end];
+}
