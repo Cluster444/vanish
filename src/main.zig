@@ -35,14 +35,14 @@ fn dbg_prompt(prompt: *CommandPrompt) void {
     var buf = RingBuffer(1024, false){ .name = "" };
     var tmp: [64]u8 = undefined;
 
-    buf.write_all(AnsiCode.code(.save));
+    buf.write_all("\x1b[s");
     buf.write_all("\x1b[2;1H\x1b[0K Prompt: ");
     buf.write_all(prompt.command_slice());
     buf.write_all("\x1b[3;1H\x1b[0K Head: ");
     const head_len = std.fmt.formatIntBuf(&tmp, prompt.head, 10, .lower, .{});
     buf.write_all(tmp[0..head_len]);
     buf.write_all("\x1b[4;1H\x1b[0K ---------------------------------------------");
-    buf.write_all(AnsiCode.code(.restore));
+    buf.write_all("\x1b[u");
 
     output.write(buf.readable_slice());
     buf.reset();
@@ -204,39 +204,47 @@ pub fn main() void {
     var running = true;
     var command: Command = .{};
     var prompt: *CommandPrompt = prompts.insert("");
+    var prompt_width: usize = 0;
 
     term.sashimi();
-    output.write("\x1b[H\x1b[2J\x1b[5;1H");
+
+    term.push(.home);
+    term.push(.clear_all);
+    term.push(.{ .move_to = .{ 5, 1 } });
 
     run: while (running) {
-        std.Thread.sleep(std.time.ns_per_ms * 1);
+        defer {
+            output.write(term.buffer[0..term.head]);
+            term.head = 0;
+            std.Thread.sleep(std.time.ns_per_ms * 10);
+        }
 
         switch (state) {
             .Prompting => {
                 prompts.reset();
                 prompt = prompts.insert("");
-                output.write(fs.path.basename(cwd.path()));
-                output.write(" 👻 ");
-                state = .ReadingInput;
-                prompts.reset();
                 term.sashimi();
+                term.write(fs.path.basename(cwd.path()));
+                term.write(" 👻 ");
+                prompt_width = term.head;
+                state = .ReadingInput;
             },
             .ReadingInput => {
                 dbg_prompt(prompt);
                 if (input.read_byte()) |byte| {
                     switch (byte) {
                         asc.CTRL_C => {
-                            output.writeln("CTRL_C");
+                            term.write("CTRL_C");
                             running = false;
                         },
                         asc.LINE_FEED, asc.CAR_RETURN => {
                             state = if (prompt.head == 0) .Prompting else .Parsing;
-                            output.write("\r\n");
+                            term.write("\r\n");
                         },
                         asc.BACKSPACE, asc.DELETE => {
                             if (prompt.head > 0) {
-                                output.write_byte(asc.BACKSPACE);
-                                output.write(AnsiCode.code(.clear_right));
+                                term.write_byte(asc.BACKSPACE);
+                                term.push(.clear_right);
                                 prompt.drop(1);
                             }
                         },
@@ -262,7 +270,7 @@ pub fn main() void {
                                 continue :run;
                             } else {
                                 // Path Completion
-                                output.write("\x1b[s");
+                                term.push(.save);
                                 const arg = command.argv[command.argc - 1];
 
                                 const slash_pos = stx.index(arg, '/');
@@ -280,7 +288,8 @@ pub fn main() void {
                                 var found = false;
                                 var dir_iter = search_dir.iterate();
 
-                                output.write("\r\n\x1b[0J");
+                                term.write("\r\n");
+                                term.push(.clear_down);
                                 // TODO: This needs to be buffered for two reasons
                                 // 1) To provide proper handling when the prompt is
                                 //    at the bottom of the screen. Our cursor position
@@ -307,20 +316,21 @@ pub fn main() void {
                                             }
                                         }
                                         completions += 1;
-                                        output.write(completion);
-                                        output.write("\t");
+                                        term.write(completion);
+                                        term.write("\t");
                                     }
                                 }
 
                                 if (completions == 1) {
-                                    output.write("\r\x1b[2K");
+                                    term.write("\r");
+                                    term.push(.clear_right);
                                 }
 
-                                output.write("\x1b[u");
+                                term.push(.restore);
                                 if (completions > 0) {
                                     if (extend.len > 0) {
                                         prompt.insert(prompt.head, extend);
-                                        output.write(extend);
+                                        term.write(extend);
                                     }
 
                                     if (completions == 1) {
@@ -330,10 +340,10 @@ pub fn main() void {
                                         const path_dir = cwd.dir.openDir(path, .{ .iterate = true }) catch null;
                                         if (path_dir) |_| {
                                             prompt.insert(prompt.head, "/");
-                                            output.write_byte('/');
+                                            term.write_byte('/');
                                         } else {
                                             prompt.insert(prompt.head, " ");
-                                            output.write_byte(' ');
+                                            term.write_byte(' ');
                                         }
                                     }
                                 }
@@ -349,10 +359,10 @@ pub fn main() void {
                                         if (history.prev_line()) |line| {
                                             if (prompt.command_slice().len > 0) {
                                                 const comlen: u8 = @intCast(prompt.command_slice().len);
-                                                output.write(AnsiCode.code(.{ .move_left = comlen }));
-                                                output.write(AnsiCode.code(.clear_right));
+                                                term.push(.{ .move_left = comlen });
+                                                term.push(.clear_right);
                                             }
-                                            output.write(line);
+                                            term.write(line);
 
                                             if (prompts.prev()) |buf| {
                                                 prompt = buf;
@@ -366,10 +376,11 @@ pub fn main() void {
                                         if (history.next_line()) |line| {
                                             if (prompt.command_slice().len > 0) {
                                                 const comlen: u8 = @intCast(prompt.command_slice().len);
-                                                output.write(AnsiCode.code(.{ .move_left = comlen }));
-                                                output.write(AnsiCode.code(.clear_right));
+                                                // term.push(.{ .move_left = comlen, .clear_right });
+                                                term.push(.{ .move_left = comlen });
+                                                term.push(.clear_right);
                                             }
-                                            output.write(line);
+                                            term.write(line);
 
                                             if (prompts.next()) |buf| {
                                                 prompt = buf;
@@ -383,11 +394,11 @@ pub fn main() void {
                                     'D' => { // Key left
                                     },
                                     else => {
-                                        output.writeln("Unknown Escape Key");
+                                        term.write("Unknown Escape Key");
                                     },
                                 }
                             } else {
-                                output.writeln("Bad Escape Sequence");
+                                term.write("Bad Escape Sequence");
                                 state = .Prompting;
                                 continue :run;
                             }
@@ -395,7 +406,7 @@ pub fn main() void {
                         else => {
                             @branchHint(.likely);
                             // TODO: Completion Hint
-                            output.write_byte(byte);
+                            term.write_byte(byte);
                             prompt.push(byte);
                         },
                     }
@@ -490,7 +501,7 @@ pub fn main() void {
                                     continue :path;
                                 },
                                 else => {
-                                    output.writeln("Permission Denied");
+                                    term.write("Permission Denied\r\n");
                                     state = .Prompting;
                                     continue :run;
                                 },
@@ -503,7 +514,7 @@ pub fn main() void {
                             break :path;
                         }
                     } else {
-                        output.writeln("Command not found");
+                        term.write("Command not found\r\n");
                         state = .Prompting;
                         continue :run;
                     }
@@ -529,7 +540,8 @@ pub fn main() void {
                 switch (command.builtin.?) {
                     .exit => running = false,
                     .pwd => {
-                        output.writeln(cwd.path());
+                        term.push(.{ .move_down_line = 1 });
+                        term.write(cwd.path());
                     },
                     .cd => {
                         dbg("Command: {d} : {any}", .{ command.argc, command.argv[0..command.argc] });
@@ -553,19 +565,12 @@ pub fn main() void {
                 defer scratch.deinit();
                 const allocator = scratch.allocator();
 
-                output.write("+ ");
+                term.write("+ ");
                 for (command.argv[0..command.argc]) |arg| {
-                    output.write_byte(' ');
-                    output.write(arg);
+                    term.write_byte(' ');
+                    term.write(arg);
                 }
-                output.write_byte(asc.LINE_FEED);
-
-                if (false) {
-                    for (command.argv[0..command.argc], 0..) |arg, i| {
-                        dbg("\r\nArg {d}: {s}", .{ i, arg });
-                    }
-                    dbg("\r\n", .{});
-                }
+                term.write("\r\n");
 
                 var child = std.process.Child.init(command.argv[0..command.argc], allocator);
                 child.stdin_behavior = .Inherit;
@@ -580,13 +585,13 @@ pub fn main() void {
                         history.insert(prompt.command_slice());
                     },
                     .Signal => {
-                        output.write("Signaled\n");
+                        term.write("Signaled\n");
                     },
                     .Stopped => {
-                        output.write("Stopped\n");
+                        term.write("Stopped\n");
                     },
                     .Unknown => {
-                        output.write("Unknown\n");
+                        term.write("Unknown\n");
                     },
                 }
             },
@@ -1291,6 +1296,10 @@ const Term = struct {
     welldone: psx.termios = undefined,
     rare: psx.termios = undefined,
 
+    output: *Output = undefined,
+    buffer: [1 * MB]u8 = undefined,
+    head: usize = 0,
+
     pub fn init(self: *Term) void {
         self.welldone = psx.tcgetattr(std.posix.STDIN_FILENO) catch unreachable;
         self.rare = self.welldone;
@@ -1320,6 +1329,99 @@ const Term = struct {
     pub fn sashimi(self: *Term) void {
         psx.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.rare) catch unreachable;
     }
+
+    pub fn write(self: *Term, bytes: []const u8) void {
+        stx.memcpy(self.buffer[self.head..], bytes);
+        self.head += bytes.len;
+    }
+
+    pub fn write_fmt(self: *Term, comptime fmt: []const u8, args: anytype) void {
+        var buf: [1024]u8 = undefined;
+        const res = std.fmt.bufPrint(buf[0..1024], fmt, args) catch unreachable;
+        self.write(res);
+    }
+
+    pub fn write_byte(self: *Term, byte: u8) void {
+        self.buffer[self.head] = byte;
+        self.head += 1;
+    }
+
+    pub fn push(self: *Term, code: AnsiCode) void {
+        switch (code) {
+            // zig fmt: off
+            .home            => self.csi("H"),
+            .save            => self.csi("s"),
+            .restore         => self.csi("u"),
+            .clear_down      => self.csi("0J"),
+            .clear_up        => self.csi("1J"),
+            .clear_all       => self.csi("2J"),
+            .clear_right     => self.csi("0K"),
+            .clear_left      => self.csi("1K"),
+            .clear_line      => self.csi("2K"),
+            .move_up         => |n| self.csi_fmt("{d}A", .{n}),
+            .move_down       => |n| self.csi_fmt("{d}B", .{n}),
+            .move_right      => |n| self.csi_fmt("{d}C", .{n}),
+            .move_left       => |n| self.csi_fmt("{d}D", .{n}),
+            .move_down_line  => |n| self.csi_fmt("{d}E", .{n}),
+            .move_up_line    => |n| self.csi_fmt("{d}F", .{n}),
+            .move_col        => |n| self.csi_fmt("{d}G", .{n}),
+            .move_to         => |n| self.csi_fmt("{d};{d}H", .{n[0], n[1]}),
+            .scroll_up       => |n| self.csi_fmt("{d}S", .{n}),
+            .scroll_down     => |n| self.csi_fmt("{d}T", .{n}),
+            // else => {},
+            // zig fmt: on
+        }
+    }
+
+    fn csi(self: *Term, bytes: []const u8) void {
+        self.buffer[self.head..][0..2].* = .{ asc.ESCAPE, '[' };
+        self.head += 2;
+        self.write(bytes);
+    }
+
+    fn csi_fmt(self: *Term, comptime fmt: []const u8, args: anytype) void {
+        var buf: [64]u8 = undefined;
+        const res = std.fmt.bufPrint(buf[0..64], fmt, args) catch unreachable;
+        self.csi(res);
+    }
+
+    test "term push" {
+        var test_term = Term{};
+        test_term.push(.home);
+        try t.expectEqual(3, test_term.head);
+        try t.expectEqualStrings("\x1b[H", test_term.buffer[0..3]);
+        test_term.push(.clear_all);
+        try t.expectEqual(7, test_term.head);
+        try t.expectEqualStrings("\x1b[2J", test_term.buffer[3..7]);
+        test_term.push(.{ .move_to = .{ 5, 1 } });
+        try t.expectEqual(13, test_term.head);
+        try t.expectEqualStrings("\x1b[5;1H", test_term.buffer[7..13]);
+        test_term.push(.{ .move_to = .{ 212, 109 } });
+        try t.expectEqual(23, test_term.head);
+        try t.expectEqualStrings("\x1b[212;109H", test_term.buffer[13..23]);
+    }
+};
+
+const AnsiCode = union(enum) {
+    move_up: u8,
+    move_down: u8,
+    move_right: u8,
+    move_left: u8,
+    move_up_line: u8,
+    move_down_line: u8,
+    move_col: u8,
+    move_to: struct { u8, u8 },
+    scroll_up: u8,
+    scroll_down: u8,
+    home,
+    save,
+    restore,
+    clear_up,
+    clear_down,
+    clear_all,
+    clear_right,
+    clear_left,
+    clear_line,
 };
 
 // zig fmt: off
@@ -1350,68 +1452,7 @@ const asc = struct {
     const CTRL_C     = END_TEXT;
 };
 // zig fmt: on
-
-const AnsiCode = union(enum) {
-    move_up: u8,
-    move_down: u8,
-    move_right: u8,
-    move_left: u8,
-    move_begin_up: u8,
-    move_begin_down: u8,
-    move_col: u8,
-    move_to: struct { u8, u8 },
-    scroll_up: u8,
-    scroll_down: u8,
-    home,
-    clear_up,
-    clear_down,
-    clear_all,
-    clear_right,
-    clear_left,
-    clear_line,
-    save,
-    restore,
-    dsr_ok,
-    dsr_status,
-    dsr_cursor,
-    mode_origin,
-
-    const ESC = "\x1b";
-    const CSI = "\x1b[";
-
-    pub fn code(self: AnsiCode) []const u8 {
-        switch (self) {
-            // zig fmt: off
-            .move_up         => |n| return format(CSI ++ "{d}A", .{n}),
-            .move_down       => |n| return format(CSI ++ "{d}B", .{n}),
-            .move_right      => |n| return format(CSI ++ "{d}C", .{n}),
-            .move_left       => |n| return format(CSI ++ "{d}D", .{n}),
-            .move_begin_up   => |n| return format(CSI ++ "{d}E", .{n}),
-            .move_begin_down => |n| return format(CSI ++ "{d}F", .{n}),
-            .move_col        => |n| return format(CSI ++ "{d}G", .{n}),
-            .move_to         => |n| return format(CSI ++ "{d};{d}H", .{n[0], n[1]}),
-            .scroll_up       => |n| return format(CSI ++ "{d}S", .{n}),
-            .scroll_down     => |n| return format(CSI ++ "{d}T", .{n}),
-            .home            => return CSI ++ "H",
-            .clear_up        => return CSI ++ "0J",
-            .clear_down      => return CSI ++ "1J",
-            .clear_all       => return CSI ++ "2J",
-            .clear_right     => return CSI ++ "0K",
-            .clear_left      => return CSI ++ "1K",
-            .clear_line      => return CSI ++ "2K",
-            .save            => return CSI ++ "s",
-            .restore         => return CSI ++ "u",
-            .dsr_ok          => return CSI ++ "0n",
-            .dsr_status      => return CSI ++ "5n",
-            .dsr_cursor      => return CSI ++ "6n",
-            .mode_origin     => return CSI ++ "?6h",
-            // zig fmt: on
-        }
-    }
-
-    fn format(comptime fmt: []const u8, args: anytype) []const u8 {
-        var buffer: [32]u8 = undefined;
-        const res = std.fmt.bufPrint(&buffer, fmt, args) catch unreachable;
-        return res;
-    }
-};
+//
+test {
+    t.refAllDecls(@This());
+}
