@@ -340,8 +340,8 @@ pub fn main() void {
                             }
                         },
                         asc.ESCAPE => {
-                            const ack_esc = (input.read_byte() orelse 0) == '[';
-                            if (ack_esc) {
+                            const csi_esc = (input.read_byte() orelse 0) == '[';
+                            if (csi_esc) {
                                 const esc_byte = input.read_byte() orelse 0;
 
                                 switch (esc_byte) {
@@ -361,6 +361,7 @@ pub fn main() void {
                                             }
                                         }
                                     },
+                                    // FIXME: Going down is causing the cursor to drift right
                                     'B' => { // Key Down
                                         if (history.next_line()) |line| {
                                             if (prompt.command_slice().len > 0) {
@@ -792,11 +793,16 @@ const CommandPrompt = struct {
         }
 
         pub fn next(self: *Iterator) ?[]const u8 {
-            if (self.peek()) |arg| {
+            if (self.version != self.prompt.version) {
+                self.refresh();
+            }
+
+            if (self.parse(self.cursor)) |arg| {
                 self.cursor = self.skip_spaces(self.cursor);
                 self.cursor += arg.len;
+                assert(self.cursor <= self.buffer.len);
 
-                return arg;
+                return dequote(arg);
             } else {
                 return null;
             }
@@ -807,20 +813,24 @@ const CommandPrompt = struct {
                 self.refresh();
             }
 
-            var state: Iterator.State = .Unescaped;
-
-            var begin = self.cursor;
-            if (self.buffer.len == begin) {
+            if (self.parse(self.cursor)) |arg| {
+                return dequote(arg);
+            } else {
                 return null;
             }
+        }
 
-            begin = self.skip_spaces(begin);
-
+        fn parse(self: *Iterator, from: usize) ?[]const u8 {
+            if (self.buffer.len == from) {
+                return null;
+            }
+            const begin = self.skip_spaces(from);
             if (self.buffer.len == begin) {
                 return self.buffer[begin..begin];
             }
 
             // TODO: Handle backslash escapes
+            var state: Iterator.State = .Unescaped;
             const end: usize = blk: for (
                 self.buffer[begin..],
                 begin..,
@@ -858,6 +868,9 @@ const CommandPrompt = struct {
                 break :blk self.buffer.len;
             };
 
+            assert(state == .Unescaped);
+            assert(begin <= end);
+
             return self.buffer[begin..end];
         }
 
@@ -867,6 +880,17 @@ const CommandPrompt = struct {
                 result += 1;
             }
             return result;
+        }
+
+        fn dequote(arg: []const u8) []const u8 {
+            if (is_quoted(arg)) {
+                return arg[1 .. arg.len - 1];
+            }
+            return arg;
+        }
+
+        fn is_quoted(arg: []const u8) bool {
+            return arg.len > 2 and (arg[0] == asc.DQUOTE or arg[0] == asc.SQUOTE) and arg[0] == arg[arg.len - 1];
         }
     };
 };
