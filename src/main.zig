@@ -31,7 +31,7 @@ fn dbg(comptime fmt: []const u8, args: anytype) void {
     output.write("\x1b[u");
 }
 
-fn dbg_prompt(prompt: *CommandPrompt) void {
+fn dbg_prompt(prompt: *CommandBuffer) void {
     var buf = RingBuffer(1024, false){ .name = "" };
     var tmp: [64]u8 = undefined;
 
@@ -121,7 +121,7 @@ pub fn main() void {
     memblk.reserve(.static, Aliases, 1);
     memblk.reserve(.static, History, 1);
     memblk.reserve(.static, BumpAlloc, 1);
-    memblk.reserve(.static, CommandPrompts, 1);
+    memblk.reserve(.static, CommandBuffers, 1);
     memblk.reserve(.static, Input, 1);
     memblk.reserve(.static, Output, 2);
     memblk.reserve(.static, TempMem, 1);
@@ -133,7 +133,7 @@ pub fn main() void {
     var static_blk = memblk.block(.static);
     const aliases = static_blk.create(Aliases);
     const history = static_blk.create(History);
-    const prompts = static_blk.create(CommandPrompts);
+    const combufs = static_blk.create(CommandBuffers);
     input = static_blk.create(Input);
     output = static_blk.create(Output);
     outerr = static_blk.create(Output);
@@ -203,34 +203,48 @@ pub fn main() void {
     var state: PromptState = .Prompting;
     var running = true;
     var command: Command = .{};
-    var prompt: *CommandPrompt = prompts.insert("");
-    var prompt_width: usize = 0;
+    combufs.reset();
+    var combuf: *CommandBuffer = &combufs.buffers[0];
+    var prompt = Prompt{};
+
+    prompt.write(fs.path.basename(cwd.path()));
+    prompt.write(" 👻 ");
 
     term.sashimi();
-
     term.push(.home);
     term.push(.clear_all);
-    term.push(.{ .move_to = .{ 5, 1 } });
+    term.push(.{ .move_to = .{ 6, 1 } });
+
+    var dp = DebugPanel{ .term = &term };
 
     run: while (running) {
         defer {
             output.write(term.buffer[0..term.head]);
             term.head = 0;
+            if (dp.show) {
+                dp.draw();
+            }
             std.Thread.sleep(std.time.ns_per_ms * 10);
         }
 
         switch (state) {
             .Prompting => {
-                prompts.reset();
-                prompt = prompts.insert("");
+                combufs.reset();
+                combuf = &combufs.buffers[0];
                 term.sashimi();
-                term.write(fs.path.basename(cwd.path()));
-                term.write(" 👻 ");
-                prompt_width = term.head;
                 state = .ReadingInput;
             },
             .ReadingInput => {
-                dbg_prompt(prompt);
+                // dbg_prompt(combuf);
+                dp.dbg_history(history);
+                dp.dbg_combuf(combuf);
+                dp.dbg_combufs(combufs);
+
+                term.write("\r");
+                term.push(.clear_line);
+                term.write(prompt.buffer[0..prompt.head]);
+                term.write(combuf.buffer[0..combuf.head]);
+
                 if (input.read_byte()) |byte| {
                     switch (byte) {
                         asc.CTRL_C => {
@@ -238,21 +252,21 @@ pub fn main() void {
                             running = false;
                         },
                         asc.LINE_FEED, asc.CAR_RETURN => {
-                            state = if (prompt.head == 0) .Prompting else .Parsing;
+                            state = if (combuf.head == 0) .Prompting else .Parsing;
                             term.write("\r\n");
                         },
                         asc.BACKSPACE, asc.DELETE => {
-                            if (prompt.head > 0) {
+                            if (combuf.head > 0) {
                                 term.write_byte(asc.BACKSPACE);
                                 term.push(.clear_right);
-                                prompt.drop(1);
+                                combuf.drop(1);
                             }
                         },
                         asc.HORIZ_TAB => {
                             // :Completions
                             //
                             dbg("", .{});
-                            var args_iter = prompt.iterator();
+                            var args_iter = combuf.iterator();
 
                             command = .{ .argc = 0, .argv = undefined };
 
@@ -329,7 +343,7 @@ pub fn main() void {
                                 term.push(.restore);
                                 if (completions > 0) {
                                     if (extend.len > 0) {
-                                        prompt.insert(prompt.head, extend);
+                                        combuf.insert(combuf.head, extend);
                                         term.write(extend);
                                     }
 
@@ -339,10 +353,10 @@ pub fn main() void {
                                         stx.memcpy(path[prefix.len..], extend);
                                         const path_dir = cwd.dir.openDir(path, .{ .iterate = true }) catch null;
                                         if (path_dir) |_| {
-                                            prompt.insert(prompt.head, "/");
+                                            combuf.insert(combuf.head, "/");
                                             term.write_byte('/');
                                         } else {
-                                            prompt.insert(prompt.head, " ");
+                                            combuf.insert(combuf.head, " ");
                                             term.write_byte(' ');
                                         }
                                     }
@@ -357,36 +371,25 @@ pub fn main() void {
                                 switch (esc_byte) {
                                     'A' => { // Key Up
                                         if (history.prev_line()) |line| {
-                                            if (prompt.command_slice().len > 0) {
-                                                const comlen: u8 = @intCast(prompt.command_slice().len);
-                                                term.push(.{ .move_left = comlen });
-                                                term.push(.clear_right);
-                                            }
-                                            term.write(line);
-
-                                            if (prompts.prev()) |buf| {
-                                                prompt = buf;
+                                            if (combufs.prev()) |cb| {
+                                                combuf = cb;
                                             } else {
-                                                prompt = prompts.insert(line);
+                                                combufs.insert(line);
+                                                combuf = combufs.prev().?;
                                             }
+                                            term.write("\r");
+                                            term.push(.clear_line);
+                                            term.write(prompt.buffer[0..prompt.head]);
+                                            term.write(combuf.buffer[0..combuf.head]);
                                         }
                                     },
-                                    // FIXME: Going down is causing the cursor to drift right
                                     'B' => { // Key Down
-                                        if (history.next_line()) |line| {
-                                            if (prompt.command_slice().len > 0) {
-                                                const comlen: u8 = @intCast(prompt.command_slice().len);
-                                                // term.push(.{ .move_left = comlen, .clear_right });
-                                                term.push(.{ .move_left = comlen });
-                                                term.push(.clear_right);
-                                            }
-                                            term.write(line);
-
-                                            if (prompts.next()) |buf| {
-                                                prompt = buf;
-                                            } else {
-                                                prompt = prompts.insert(line);
-                                            }
+                                        if (history.next_line()) |_| {
+                                            combuf = combufs.next().?;
+                                            term.write("\r");
+                                            term.push(.clear_line);
+                                            term.write(prompt.buffer[0..prompt.head]);
+                                            term.write(combuf.buffer[0..combuf.head]);
                                         }
                                     },
                                     'C' => { // Key right
@@ -403,11 +406,17 @@ pub fn main() void {
                                 continue :run;
                             }
                         },
+                        ' ' => {
+                            if (combuf.head > 0) {
+                                term.write_byte(byte);
+                                combuf.push(byte);
+                            }
+                        },
                         else => {
                             @branchHint(.likely);
                             // TODO: Completion Hint
                             term.write_byte(byte);
-                            prompt.push(byte);
+                            combuf.push(byte);
                         },
                     }
                 }
@@ -432,10 +441,10 @@ pub fn main() void {
                 // unset - delete a function
                 // hash -d <name> delete a hash table entry
 
-                assert(prompt.head > 0);
+                assert(combuf.head > 0);
 
-                var runbuf = CommandPrompt{};
-                prompt.copy(&runbuf);
+                var runbuf = CommandBuffer{};
+                combuf.copy(&runbuf);
                 var args_iter = runbuf.iterator();
 
                 // :ExpandAlias
@@ -534,17 +543,16 @@ pub fn main() void {
                 state = .ExecutingCommand;
             },
             .ExecutingBuiltin => {
-                term.cooked();
+                // term.cooked();
                 defer state = .Prompting;
 
                 switch (command.builtin.?) {
                     .exit => running = false,
                     .pwd => {
-                        term.push(.{ .move_down_line = 1 });
                         term.write(cwd.path());
+                        term.push(.{ .move_down_line = 1 });
                     },
                     .cd => {
-                        dbg("Command: {d} : {any}", .{ command.argc, command.argv[0..command.argc] });
                         if (command.argc > 1) {
                             const reldir = command.argv[1];
                             cwd.chdir(reldir) catch |err| {
@@ -554,6 +562,7 @@ pub fn main() void {
                         }
                     },
                 }
+                history.insert(combuf.command_slice());
             },
             .ExecutingCommand => {
                 term.cooked();
@@ -581,8 +590,11 @@ pub fn main() void {
                 const child_term = child.wait() catch unreachable;
 
                 switch (child_term) {
-                    .Exited => {
-                        history.insert(prompt.command_slice());
+                    .Exited => |exit_code| {
+                        std.debug.print("Exited: {any}\n", .{child_term});
+                        if (exit_code == 0) {
+                            history.insert(combuf.command_slice());
+                        }
                     },
                     .Signal => {
                         term.write("Signaled\n");
@@ -604,11 +616,11 @@ fn AliasMap(comptime size: usize) type {
 
     // Stores data in len:str format for the
     // key and value.
+    // [len][alias] [len][command]
+    // [u8] [[N]u8] [u8] [[N]u8]
     return struct {
         buffer: [size]u8 = undefined,
-        // cache: [64][8]u16 = undefined,
         head: usize = 0,
-        // Cache
 
         const Self = @This();
         const SIZE = size;
@@ -655,88 +667,76 @@ const Command = struct {
     builtin: ?Builtins = null,
 };
 
-// :CommandPrompt | :Prompt
-//
-const CommandPrompts = struct {
-    buffers: [64]CommandPrompt = undefined,
+const CommandBuffers = struct {
+    buffers: [64]CommandBuffer = undefined,
     head: usize = 0,
     cursor: usize = 0,
 
-    pub fn reset(self: *CommandPrompts) void {
-        self.head = 0;
+    pub fn reset(self: *CommandBuffers) void {
+        self.head = 1;
         self.cursor = 0;
+        self.buffers[0] = CommandBuffer{};
     }
 
-    pub fn insert(self: *CommandPrompts, bytes: []const u8) *CommandPrompt {
-        self.buffers[self.head] = CommandPrompt{};
+    pub fn insert(self: *CommandBuffers, bytes: []const u8) void {
+        self.buffers[self.head] = CommandBuffer{};
         if (bytes.len > 0) {
             self.buffers[self.head].insert(0, bytes);
         }
         self.head += 1;
-        self.cursor += 1;
-        return &self.buffers[self.head - 1];
     }
 
-    pub fn next(self: *CommandPrompts) ?*CommandPrompt {
+    pub fn next(self: *CommandBuffers) ?*CommandBuffer {
         if (self.cursor > 0) {
             self.cursor -= 1;
             return &self.buffers[self.cursor];
-        } else {
-            return null;
-        }
+        } else return null;
     }
 
-    pub fn prev(self: *CommandPrompts) ?*CommandPrompt {
-        if (self.cursor < self.head) {
-            const result = &self.buffers[self.cursor];
+    pub fn prev(self: *CommandBuffers) ?*CommandBuffer {
+        if (self.cursor < self.head - 1) {
             self.cursor += 1;
-            return result;
-        } else {
-            return null;
-        }
+            return &self.buffers[self.cursor];
+        } else return null;
     }
 
     pub fn debug() void {}
 };
 
-const CommandPrompt = struct {
+const CommandBuffer = struct {
     buffer: [SIZE]u8 = undefined,
     head: usize = 0,
     version: usize = 0,
 
     const SIZE = 4096;
 
-    pub fn init(self: *CommandPrompt) void {
+    pub fn init(self: *CommandBuffer) void {
         self.head = 0;
         @memset(self.buffer[0..SIZE], 0);
     }
 
-    pub fn copy(self: *CommandPrompt, to: *CommandPrompt) void {
+    pub fn copy(self: *CommandBuffer, to: *CommandBuffer) void {
         stx.memcpy(to.buffer[0..], self.buffer[0..self.head]);
         to.head = self.head;
         to.version = 0;
     }
 
-    pub fn reset(self: *CommandPrompt) void {
+    pub fn reset(self: *CommandBuffer) void {
         @memset(self.buffer[0..self.head], 0);
         stx.assert_zeroes(self.buffer[0..SIZE]);
         self.head = 0;
     }
 
-    pub fn command_slice(self: *CommandPrompt) []const u8 {
+    pub fn command_slice(self: *CommandBuffer) []const u8 {
         return self.buffer[0..self.head];
     }
 
-    pub fn push(self: *CommandPrompt, byte: u8) void {
-        if (byte == ' ' and self.head == 0) {
-            @branchHint(.cold);
-            return;
-        }
+    pub fn push(self: *CommandBuffer, byte: u8) void {
         self.buffer[self.head] = byte;
         self.head += 1;
     }
 
-    pub fn drop(self: *CommandPrompt, n: usize) void {
+    pub fn drop(self: *CommandBuffer, n: usize) void {
         if (self.head >= n) {
             self.head -= n;
         } else {
@@ -744,7 +744,7 @@ const CommandPrompt = struct {
         }
     }
 
-    pub fn insert(self: *CommandPrompt, index: usize, source: []const u8) void {
+    pub fn insert(self: *CommandBuffer, index: usize, source: []const u8) void {
         assert(self.buffer.len >= self.head + source.len);
         stx.memcpy(self.buffer[index..][source.len..], self.buffer[index..self.head]);
         stx.memcpy(self.buffer[index..], source);
@@ -752,7 +752,7 @@ const CommandPrompt = struct {
         self.head += source.len;
     }
 
-    pub fn replace(self: *CommandPrompt, target: []const u8, source: []const u8) void {
+    pub fn replace(self: *CommandBuffer, target: []const u8, source: []const u8) void {
         const begin = @intFromPtr(target.ptr) - @intFromPtr(&self.buffer);
         const target_end = begin + target.len;
         const source_end = begin + source.len;
@@ -770,7 +770,7 @@ const CommandPrompt = struct {
         self.version += 1;
     }
 
-    pub fn iterator(self: *CommandPrompt) Iterator {
+    pub fn iterator(self: *CommandBuffer) Iterator {
         return .{
             .prompt = self,
             .cursor = 0,
@@ -779,14 +779,14 @@ const CommandPrompt = struct {
         };
     }
 
-    pub fn debug(self: *CommandPrompt) void {
+    pub fn debug(self: *CommandBuffer) void {
         dbg("Buffer: {s}\n", .{self.buffer[0..self.head]});
     }
 
     pub const Iterator = struct {
         const State = enum { Unescaped, EscapedDouble, EscapedSingle };
 
-        prompt: *CommandPrompt,
+        prompt: *CommandBuffer,
         buffer: []const u8,
         cursor: usize = 0,
         version: usize = 0,
@@ -900,12 +900,84 @@ const CommandPrompt = struct {
     };
 };
 
+pub fn U8(n: u64) u8 {
+    return @intCast(n);
+}
+
+const DebugPanel = struct {
+    term: *Term,
+    buffers: [64][32]u8 = undefined,
+    buflens: [64]u8 = undefined,
+    head: usize = 0,
+    show: bool = true,
+
+    pub fn print(self: *DebugPanel, comptime fmt: []const u8, args: anytype) void {
+        const res = std.fmt.bufPrint(self.buffers[self.head][0..31], fmt, args) catch unreachable;
+        self.buflens[self.head] = U8(res.len);
+        self.head += 1;
+    }
+
+    pub fn draw(self: *DebugPanel) void {
+        // std.debug.print("\r\n{d}", .{std.time.microTimestamp()});
+        defer self.head = 0;
+        term.push(.save);
+        defer term.push(.restore);
+
+        const cols: u8 = 5;
+        const rows: u8 = @max(5, U8((self.head + (cols - 1)) / cols));
+
+        for (0..rows) |row| {
+            term.push(.{ .move_to = .{ U8(row + 1), 1 } });
+            term.push(.clear_line);
+            term.write_byte(U8(row + 1 + '0'));
+            term.write(": ");
+
+            for (0..cols) |col| {
+                term.push(.{ .move_col = U8(col * 32 + 4) });
+                const idx = row * cols + col;
+                if (idx < self.head) {
+                    self.term.write(self.buffers[idx][0..self.buflens[idx]]);
+                }
+            }
+        }
+    }
+
+    fn dbg_history(dp: *DebugPanel, history: *History) void {
+        // const hist = history.ring.readable_slice();
+        // var cursor: usize = 0;
+
+        dp.print("HC: {d}/{d}", .{ history.cursor, history.ring.head.raw });
+        dp.print("HB: {s}", .{history.current()});
+        // var count: usize = 1;
+        // while (cursor < hist.len) {
+        //     const len = hist[cursor];
+        //     dp.print("H{d}: {s}", .{ count, hist[cursor + 1 .. cursor + 1 + len] });
+        //     cursor += len + 2;
+        //     count += 1;
+        // }
+    }
+
+    fn dbg_combuf(dp: *DebugPanel, combuf: *CommandBuffer) void {
+        dp.print("CA:{d} {s}", .{ combuf.head, combuf.buffer[0..combuf.head] });
+    }
+
+    fn dbg_combufs(dp: *DebugPanel, combufs: *CommandBuffers) void {
+        // var count: usize = 1;
+        dp.print("CC:{d}/{d}", .{ combufs.cursor, combufs.head });
+        dp.print("CB:{s}", .{combufs.buffers[combufs.cursor].command_slice()});
+        // for (combufs.buffers[0..combufs.head]) |buf| {
+        //     dp.print("C{d}: {s}", .{ count, buf.buffer[0..buf.head] });
+        //     count += 1;
+        // }
+    }
+};
+
 // :HistoryList
 pub fn HistoryList(comptime cap: usize) type {
     stx.assert_log2(cap);
     assert(cap > 16 * 1024);
 
-    // The format of this buffer is laid ou in the following way:
+    // The format of this buffer is laid out in the following way:
     // [len][str][len]
     // This makes it a kind of intrusive doubly linked list using
     // 8 bit offsets as pointers to the next fat string.
@@ -957,6 +1029,16 @@ pub fn HistoryList(comptime cap: usize) type {
             self.cursor = self.ring.head.raw;
         }
 
+        pub fn current(self: *Self) []const u8 {
+            if (self.cursor == self.ring.head.raw) {
+                return self.ring.buffer[self.cursor..self.cursor];
+            }
+
+            const p_cursor = self.cursor & RB.MASK;
+            const line_len = self.ring.buffer[p_cursor];
+            return self.ring.buffer[p_cursor + 1 .. p_cursor + line_len + 1];
+        }
+
         pub fn prev_line(self: *Self) ?[]const u8 {
             if (self.cursor == self.ring.tail.raw) {
                 return null;
@@ -979,7 +1061,7 @@ pub fn HistoryList(comptime cap: usize) type {
                 const line_len = self.ring.buffer[p_cursor];
                 self.cursor += line_len + 2;
                 if (self.cursor == self.ring.head.raw) {
-                    return null;
+                    return self.ring.buffer[self.cursor..self.cursor];
                 }
             }
 
@@ -1046,6 +1128,20 @@ const Output = struct {
 
     pub fn println(self: *Output, comptime fmt: []const u8, args: anytype) void {
         self.print(fmt ++ "\r\n", args);
+    }
+};
+
+const Prompt = struct {
+    buffer: [32]u8 = undefined,
+    head: usize = 0,
+
+    fn reset(self: *Prompt) void {
+        self.head = 0;
+    }
+
+    fn write(self: *Prompt, bytes: []const u8) void {
+        stx.memcpy(self.buffer[self.head..], bytes);
+        self.head += bytes.len;
     }
 };
 
