@@ -67,10 +67,12 @@ const PromptState = enum {
 };
 
 const Builtins = enum {
+    clear,
     exit,
     pwd,
     cd,
 
+    const CLEAR = "clear";
     const EXIT = "exit";
     const PWD = "pwd";
     const CD = "cd";
@@ -79,6 +81,7 @@ const Builtins = enum {
         if (stx.str_eql(cmd, CD)) return .cd;
         if (stx.str_eql(cmd, PWD)) return .pwd;
         if (stx.str_eql(cmd, EXIT)) return .exit;
+        if (stx.str_eql(cmd, CLEAR)) return .clear;
 
         return null;
     }
@@ -210,12 +213,13 @@ pub fn main() void {
     prompt.write(fs.path.basename(cwd.path()));
     prompt.write(" 👻 ");
 
+    var dp = DebugPanel{ .term = &term };
+    dp.show = true;
+
     term.sashimi();
     term.push(.home);
     term.push(.clear_all);
-    term.push(.{ .move_to = .{ 6, 1 } });
-
-    var dp = DebugPanel{ .term = &term };
+    term.push(.{ .move_to = .{ if (dp.show) 6 else 1, 1 } });
 
     run: while (running) {
         defer {
@@ -235,10 +239,11 @@ pub fn main() void {
                 state = .ReadingInput;
             },
             .ReadingInput => {
-                // dbg_prompt(combuf);
-                dp.dbg_history(history);
-                dp.dbg_combuf(combuf);
-                dp.dbg_combufs(combufs);
+                if (dp.show) {
+                    dp.dbg_history(history);
+                    dp.dbg_combuf(combuf);
+                    dp.dbg_combufs(combufs);
+                }
 
                 term.write("\r");
                 term.push(.clear_line);
@@ -547,6 +552,10 @@ pub fn main() void {
                 defer state = .Prompting;
 
                 switch (command.builtin.?) {
+                    .clear => {
+                        term.push(.clear_all);
+                        term.push(.{ .move_to = .{ if (dp.show) 6 else 1, 1 } });
+                    },
                     .exit => running = false,
                     .pwd => {
                         term.write(cwd.path());
@@ -591,7 +600,6 @@ pub fn main() void {
 
                 switch (child_term) {
                     .Exited => |exit_code| {
-                        std.debug.print("Exited: {any}\n", .{child_term});
                         if (exit_code == 0) {
                             history.insert(combuf.command_slice());
                         }
@@ -918,7 +926,6 @@ const DebugPanel = struct {
     }
 
     pub fn draw(self: *DebugPanel) void {
-        // std.debug.print("\r\n{d}", .{std.time.microTimestamp()});
         defer self.head = 0;
         term.push(.save);
         defer term.push(.restore);
