@@ -15,21 +15,7 @@ const History = HistoryList(1 * MB);
 
 const assert = std.debug.assert;
 
-fn dbg(comptime fmt: []const u8, args: anytype) void {
-    comptime {
-        const new_fmt_len = std.mem.replacementSize(u8, fmt, "\n", "\r\n");
-        if (new_fmt_len > fmt.len) {
-            var new_fmt: [new_fmt_len]u8 = undefined;
-            _ = std.mem.replace(u8, fmt, "\n", "\r\n", new_fmt[0..]);
-        }
-    }
-
-    var buf = RingBuffer(1024, false){ .name = "" };
-    const res = std.fmt.bufPrint(buf.writable_slice(), fmt, args) catch unreachable;
-    output.write("\x1b[s\x1b[1;1H\x1b[2K");
-    output.write(res);
-    output.write("\x1b[u");
-}
+const log = std.log;
 
 fn dbg_prompt(prompt: *CommandBuffer) void {
     var buf = RingBuffer(1024, false){ .name = "" };
@@ -87,23 +73,12 @@ const Builtins = enum {
     }
 };
 
-pub const Panic = struct {
-    pub fn call(
-        msg: []const u8,
-        stack_trace: ?*std.builtin.StackTrace,
-        ret_addr: ?usize,
-    ) noreturn {
+pub const panic = std.debug.FullPanic(struct {
+    fn panic(msg: []const u8, ret_addr: ?usize) noreturn {
         term.cooked();
-        std.debug.defaultPanic(msg, stack_trace, ret_addr);
+        std.debug.simple_panic.call(msg, ret_addr);
     }
-
-    pub const sentinelMismatch = std.debug.FormattedPanic.sentinelMismatch;
-    pub const unwrapError = std.debug.FormattedPanic.unwrapError;
-    pub const outOfBounds = std.debug.FormattedPanic.outOfBounds;
-    pub const startGreaterThanEnd = std.debug.FormattedPanic.startGreaterThanEnd;
-    pub const inactiveUnionField = std.debug.FormattedPanic.inactiveUnionField;
-    pub const messages = std.debug.FormattedPanic.messages;
-};
+}.panic);
 
 var input: *Input = undefined;
 var output: *Output = undefined;
@@ -113,6 +88,7 @@ var term: Term = .{};
 var temp: *TempMem = undefined;
 
 pub fn main() void {
+    log.info("Vanish init.", .{});
     // Terminal Setup
     //
     term.init();
@@ -163,7 +139,6 @@ pub fn main() void {
         }
 
         pub fn chdir(self: *@This(), reldir: []const u8) !void {
-            dbg("Chdir: {s}", .{reldir});
             var newdir = try self.dir.openDir(reldir, .{ .iterate = true });
             errdefer newdir.close();
 
@@ -214,12 +189,16 @@ pub fn main() void {
     prompt.write(" 👻 ");
 
     var dp = DebugPanel{ .term = &term };
-    dp.show = true;
+    dp.show = false;
 
     term.sashimi();
     term.push(.home);
     term.push(.clear_all);
     term.push(.{ .move_to = .{ if (dp.show) 6 else 1, 1 } });
+    output.write(term.buffer[0..term.head]);
+    term.head = 0;
+
+    var got_input = false;
 
     run: while (running) {
         defer {
@@ -228,7 +207,13 @@ pub fn main() void {
             if (dp.show) {
                 dp.draw();
             }
-            std.Thread.sleep(std.time.ns_per_ms * 10);
+
+            // TODO: We dont really want to sleep here on every loop end, instead
+            // it would be better to only sleep when we get no input. But this makes
+            // testing difficult. Might need some flag that allows some synchronizing
+            // between the test mock terminal and the shell.
+            const sleep_time: usize = if (got_input) 1 else 10;
+            std.Thread.sleep(std.time.ns_per_ms * sleep_time);
         }
 
         switch (state) {
@@ -250,7 +235,9 @@ pub fn main() void {
                 term.write(prompt.buffer[0..prompt.head]);
                 term.write(combuf.buffer[0..combuf.head]);
 
+                got_input = false;
                 if (input.read_byte()) |byte| {
+                    got_input = true;
                     switch (byte) {
                         asc.CTRL_C => {
                             term.write("CTRL_C");
@@ -270,7 +257,6 @@ pub fn main() void {
                         asc.HORIZ_TAB => {
                             // :Completions
                             //
-                            dbg("", .{});
                             var args_iter = combuf.iterator();
 
                             command = .{ .argc = 0, .argv = undefined };
@@ -382,20 +368,23 @@ pub fn main() void {
                                                 combufs.insert(line);
                                                 combuf = combufs.prev().?;
                                             }
-                                            term.write("\r");
-                                            term.push(.clear_line);
-                                            term.write(prompt.buffer[0..prompt.head]);
-                                            term.write(combuf.buffer[0..combuf.head]);
                                         }
+
+                                        term.head = 0;
+                                        term.write("\r");
+                                        term.push(.clear_line);
+                                        term.write(prompt.buffer[0..prompt.head]);
+                                        term.write(combuf.buffer[0..combuf.head]);
                                     },
                                     'B' => { // Key Down
                                         if (history.next_line()) |_| {
                                             combuf = combufs.next().?;
-                                            term.write("\r");
-                                            term.push(.clear_line);
-                                            term.write(prompt.buffer[0..prompt.head]);
-                                            term.write(combuf.buffer[0..combuf.head]);
                                         }
+                                        term.head = 0;
+                                        term.write("\r");
+                                        term.push(.clear_line);
+                                        term.write(prompt.buffer[0..prompt.head]);
+                                        term.write(combuf.buffer[0..combuf.head]);
                                     },
                                     'C' => { // Key right
                                     },
@@ -466,7 +455,6 @@ pub fn main() void {
                 }
 
                 const try_cmd = args_iter.peek().?;
-                dbg("Try Command: `{s}`", .{try_cmd});
 
                 if (Builtins.from_str(try_cmd)) |builtin| {
                     command = .{ .argc = 0, .argv = undefined };
@@ -559,7 +547,7 @@ pub fn main() void {
                     .exit => running = false,
                     .pwd => {
                         term.write(cwd.path());
-                        term.push(.{ .move_down_line = 1 });
+                        term.write("\r\n");
                     },
                     .cd => {
                         if (command.argc > 1) {
@@ -568,6 +556,9 @@ pub fn main() void {
                                 outerr.println("Failed to open dir: {!}", .{err});
                                 continue :run;
                             };
+                            prompt.reset();
+                            prompt.write(fs.path.basename(cwd.path()));
+                            prompt.write(" 👻 ");
                         }
                     },
                 }
@@ -785,10 +776,6 @@ const CommandBuffer = struct {
             .buffer = self.buffer[0..self.head],
             .version = self.version,
         };
-    }
-
-    pub fn debug(self: *CommandBuffer) void {
-        dbg("Buffer: {s}\n", .{self.buffer[0..self.head]});
     }
 
     pub const Iterator = struct {

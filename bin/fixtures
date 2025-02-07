@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+
+mkdir -p test/dir1 test/dir2 test/dir3
+
+touch test/dir1/file1 test/dir1/file2 test/dir1/file3

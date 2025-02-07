@@ -129,7 +129,7 @@ fn Blocks(comptime E: type) type {
         struct_fields[i] = .{
             .name = field.name,
             .type = BlockData,
-            .default_value = null,
+            .default_value_ptr = null,
             .is_comptime = false,
             .alignment = @alignOf(usize),
         };
